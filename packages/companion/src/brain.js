@@ -56,11 +56,14 @@ export class Brain {
    * @param {string} input.text        对方说的话（可以是合并后的一批）
    * @param {string} [input.situation] 处境描述（"你在群里，刚才在聊……"）
    * @param {Array}  [input.history]   该会话最近的消息（可选，通常靠 memory 就够）
-   * @param {boolean}[input.record=true] 是否把这一轮写回记忆
-   * @returns {Promise<{text:string, reasoning?:string, raw:any}>}
+   * @param {boolean|'deferred'} [input.record=true] 是否把这一轮写回记忆；
+   *   'deferred' 表示此刻先不写，改在返回对象上给一个一次性 commit()，由调用方决定提交时机
+   * @returns {Promise<{text:string, reasoning?:string, raw:any, commit?:() => void}>}
    */
   async reply(input) {
     const { key, userId, userName, text, situation = '', history = [], record = true } = input;
+    const deferred = record === 'deferred';
+    const shouldRecord = record && !deferred;
 
     const memLine = this.memory.renderPerson(userId);
     const recent = this.memory.renderRecent(20, { excludeWhere: key });
@@ -107,11 +110,25 @@ export class Brain {
     const msg = json.choices?.[0]?.message;
     const out = String(msg?.content || '').trim();
 
-    if (record) {
-      this.memory.remember(userId, { name: userName, topic: (text || '').slice(0, 40) + ' → ' + out.slice(0, 40) });
-      this.memory.logTurn({ where: key, who: userName || userId, text, reply: out });
+    const result = { text: out, reasoning: msg?.reasoning_content, raw: json };
+    if (shouldRecord) {
+      this.#recordTurn({ key, userId, userName, text, out });
+    } else if (deferred) {
+      // 一次性提交：首次调用即标记为已尝试，即使失败也不再重复写（错误抛给调用方日志，绝不触发重发）
+      let attempted = false;
+      result.commit = () => {
+        if (attempted) return;
+        attempted = true;
+        this.#recordTurn({ key, userId, userName, text, out });
+      };
     }
-    return { text: out, reasoning: msg?.reasoning_content, raw: json };
+    return result;
+  }
+
+  /** 把这一轮写回记忆（默认立即记与 deferred 提交共用同一份写法） */
+  #recordTurn({ key, userId, userName, text, out }) {
+    this.memory.remember(userId, { name: userName, topic: (text || '').slice(0, 40) + ' → ' + out.slice(0, 40) });
+    this.memory.logTurn({ where: key, who: userName || userId, text, reply: out });
   }
 
   /**
