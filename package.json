@@ -10,6 +10,7 @@
   "scripts": {
     "demo": "node packages/companion/examples/demo.js",
     "check": "node scripts/check.mjs",
+    "verify": "node scripts/verify.mjs",
     "phone": "node packages/phone-mcp/src/phone-mcp.js",
     "phone:test": "node packages/phone-mcp/src/phone-mcp.js --selftest",
     "qzone": "node packages/qzone/open-zone.mjs",

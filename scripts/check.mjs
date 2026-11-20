@@ -65,7 +65,10 @@ try {
   );
 
   // 唤醒
-  const w = new Waker({ names: ['小鱼'], ownerIds: ['10001'] });
+  // probability: 0 —— 关掉「普通消息按概率随机插话」。Waker 默认 probability=0.05，
+  // 不关掉时「无关 → 静音」这条断言每次运行有 5% 概率假失败，CI 会随机变红
+  // （随机性本身是产品特性，不是缺陷；这里只让**断言**确定化）。
+  const w = new Waker({ names: ['小鱼'], ownerIds: ['10001'], probability: 0 });
   const cases = [
     ['被 @', { key: 'group:1', userId: '2', text: 'hi', isAtMe: true }, true],
     ['叫名字', { key: 'group:1', userId: '2', text: '小鱼在吗' }, true],
@@ -78,14 +81,33 @@ try {
     else bad('唤醒「' + label + '」期望 ' + want + ' 实际 ' + got);
   }
 
+  // 概率唤醒本身也要有确定性用例：probability=1 时无关消息也会醒（而不是靠 5% 碰运气验证）
+  const wProb = new Waker({ names: ['小鱼'], ownerIds: ['10001'], probability: 1 });
+  const vProb = wProb.shouldWake({ key: 'group:1', userId: '2', text: '今天天气不错' });
+  if (vProb.wake && vProb.reason === 'probability') ok('随机插话（probability=1）→ 醒');
+  else bad('随机插话失效：' + JSON.stringify(vProb));
+
   // 拟人化
   const h = new Humanizer();
   const parts = h.split('第一条。第二条。第三条。');
   if (Array.isArray(parts) && parts.length > 0) ok('切分 → ' + parts.length + ' 条');
   else bad('切分异常');
   const ms = h.typingMsFor('你好啊');
-  if (ms >= 1200 && ms <= 12000) ok('打字时长 ' + ms + 'ms（合理）');
-  else bad('打字时长异常：' + ms);
+  // 抖动（±20%）和深夜 ×1.6 都是产品特性，所以断言必须按实现契约取边界，
+  // 而不是拍一个 1200：'你好啊' 取到 1455ms，负向抖动后约 1164ms，旧的
+  // `ms >= 1200` 会随机假失败。
+  const lo = Math.round(h.minMs * (1 - h.jitter));
+  const hi = Math.round(h.maxMs * (1 + h.jitter) * 1.6);
+  if (ms >= lo && ms <= hi) ok('打字时长 ' + ms + 'ms（区间 ' + lo + '~' + hi + '）');
+  else bad('打字时长异常：' + ms + '（应在 ' + lo + '~' + hi + '）');
+  // 多次采样都要在区间内——单次采样绿不能证明抖动没跑飞。
+  let outOfRange = 0;
+  for (let i = 0; i < 200; i++) {
+    const sample = h.typingMsFor('你好啊');
+    if (sample < lo || sample > hi) outOfRange++;
+  }
+  if (outOfRange === 0) ok('200 次采样都在区间内');
+  else bad('200 次采样有 ' + outOfRange + ' 次越界');
 
   // 记忆
   const tmp = path.join(ROOT, '.tmp-check');
