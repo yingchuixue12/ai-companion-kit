@@ -228,7 +228,8 @@ export async function handleTurn({ bot, brain, human, memory, waker }, items, cf
     ? '你在一个 QQ 群里。下面是群里刚连着说的几句话，最后一条是最新的。'
     : '你在跟 ' + last.name + ' 私聊。';
 
-  const { text: out } = await brain.reply({ key, userId: last.userId, userName: last.name, text, situation });
+  // deferred：这一轮先不写记忆，等真的发出去了（Humanizer 完成且 sent > 0）再一次性提交
+  const { text: out, commit } = await brain.reply({ key, userId: last.userId, userName: last.name, text, situation, record: 'deferred' });
   if (!out) { console.log('   （没说话）'); return; }
 
   if (cfg.dryRun) { console.log('   [干跑] 会说：' + out); return; }
@@ -238,6 +239,8 @@ export async function handleTurn({ bot, brain, human, memory, waker }, items, cf
     send: (m) => bot.send(key, m),
   });
   console.log('   发出 ' + r.sent + ' 条：' + r.parts.map((p) => p.slice(0, 18)).join(' | '));
+  // 发不出去就不提交；旧替身没有 commit，直接跳过
+  if (r.sent > 0) commit?.();
   waker.wake(key);
   memory.touch(last.userId, { name: last.name });
 }
