@@ -56,11 +56,12 @@
  */
 import { createReminderStore } from './reminder-store.js';
 import { classifyReminderRecovery } from './reminder-recovery.js';
+import { DELIVERY_TASK_STATUSES } from './task-status.js';
 
 /** 需要本模块处理的恢复分类。 */
 const DISPATCHABLE_KINDS = new Set(['due', 'expired', 'canceled']);
-/** send 唯一被采纳的返回值。 */
-const SEND_OUTCOMES = new Set(['sent', 'partial', 'failed', 'unknown']);
+/** send 唯一被采纳的返回值：复用共享的送达结果词表。 */
+const SEND_OUTCOMES = new Set(DELIVERY_TASK_STATUSES);
 /** claim 期间的状态：落盘后即被视为已触发、不可重发。 */
 const CLAIM_STATUS = 'processing';
 

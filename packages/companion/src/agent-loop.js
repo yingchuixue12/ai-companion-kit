@@ -1,5 +1,8 @@
 import { Inbox, LANE_STEP, LANE_TURN } from './inbox.js';
 
+// 任务状态词表放在共享模块里，这里只做转发导出，保持既有公开 API 不变。
+export { TASK_STATUSES, TERMINAL_TASK_STATUSES, DELIVERY_TASK_STATUSES } from './task-status.js';
+
 // 收拢模式下单批最多合并多少条轮次输入：既保证“最新那一组”完整，也不让一批无限长。
 const DEFAULT_MAX_TURN_BATCH = 12;
 
