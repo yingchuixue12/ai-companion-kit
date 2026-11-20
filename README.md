@@ -400,11 +400,14 @@ Windows 上不想碰命令行：双击 `packages/qzone/开通.bat`（同一个�
 ### 只要陪伴
 
 ```bash
+npm run check     # 结构与冒烟自检（仓库根目录）
+npm run verify    # 全量离线测试 + 结构和文档检查
+
 cd packages/companion
 cp config.example.json config.json     # 填 API key 和你的 QQ 号
 cp role.example.md role.md             # 改成你想要的角色
 
-npm run check     # 角色卡体检
+npm run check     # 角色卡体检（包内）
 node examples/demo.js    # 离线 demo，不需要 key
 npm run dry       # 干跑：生成但不发送
 npm start         # 真跑（需要一个 OneBot 实现，见包内 README）
