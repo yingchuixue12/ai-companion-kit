@@ -3,7 +3,9 @@
  * ─────────────────────────────────────────────────────────────
  * 把各层拼起来跑：
  *
- *   OneBot(收消息) → Waker(要不要醒) → Brain(生成回复)
+ *   OneBot(收消息) → Waker(要不要醒) → 私聊: ConversationWindow / 群聊: Waker.batch
+ *                                        ↓
+ *                                   Brain(生成回复)
  *                                        ↓
  *                                   Humanizer(怎么发)
  *                                        ↓
@@ -23,6 +25,7 @@ import { Role } from './role.js';
 import { Brain } from './brain.js';
 import { Humanizer } from './humanize.js';
 import { Waker } from './wake.js';
+import { ConversationWindow } from './conversation-window.js';
 import { OneBot } from './transport-onebot.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -67,6 +70,58 @@ export function loadConfig(explicitPath) {
   };
 }
 
+// ── 错误报告 ──────────────────────────────────────────────────
+/** 只放行不含用户内容的常见网络错误码，其余一律固定文案。 */
+const SAFE_ERROR_CODES = new Set([
+  'ECONNREFUSED', 'ECONNRESET', 'ETIMEDOUT', 'ENOTFOUND',
+  'EAI_AGAIN', 'EPIPE', 'ENETUNREACH', 'EHOSTUNREACH',
+]);
+
+/**
+ * 统一的失败报告：固定文案 + 白名单错误码。
+ * 不能转发 e.message —— Brain 的异常里可能带着原始 HTTP 响应或消息正文。
+ *
+ * @param {unknown} error
+ * @param {string} [label] 固定短语（不要拼接外部文本）
+ */
+export function reportError(error, label) {
+  const text = typeof label === 'string' && label ? label : '处理失败';
+  const code = typeof error?.code === 'string' && SAFE_ERROR_CODES.has(error.code)
+    ? '（' + error.code + '）'
+    : '';
+  console.error('[出错] ' + text + code);
+}
+
+// ── 私聊装配 ──────────────────────────────────────────────────
+/**
+ * 私聊这一段的最小可测试装配：造一个会话窗口，刷出时把原消息交给现有 handleTurn。
+ *
+ * - 消息原样进窗口（窗口会把原文冻结后原样交回）；
+ * - eligible 固定 true：私聊策略本来就是“每条都理”；
+ * - 窗口时长用原 cfg 的 privateWindowMs；
+ * - 去重：OneBot messageId 非空时，按会话作用域放进独立命名空间；
+ *   没有 id 就不传，交给模块自己按 `会话key#序号` 分配；
+ * - 失败统一由窗口的 onError 报告，不在这里重复 try/catch，也不挡后续消息。
+ *
+ * @param {{deps: object, cfg: object, windowMs?: number, onError?: (e: unknown) => void}} opts
+ */
+export function createPrivateTurnWindow({ deps, cfg, windowMs, onError } = {}) {
+  return new ConversationWindow({
+    windowMs: windowMs ?? cfg?.wake?.privateWindowMs ?? 1500,
+    onFlush: (items) => handleTurn(deps, items, cfg),
+    onError: onError || reportError,
+    onDrop: (reason) => console.error('[丢弃] 会话窗口已关闭（' + reason + '）'),
+  });
+}
+
+/** 把一条 OneBot 私聊消息推进窗口（外部 id 与窗口自动 id 分属不同命名空间）。 */
+export function pushPrivateMessage(window, msg) {
+  const id = typeof msg?.messageId === 'string' ? msg.messageId.trim() : '';
+  const options = { eligible: true };
+  if (id) options.eventId = 'onebot:' + JSON.stringify([msg.key, id]);
+  return window.push(msg.key, msg, options);
+}
+
 // ── 主程序 ────────────────────────────────────────────────────
 async function main() {
   const cfgIdx = process.argv.indexOf('--config');
@@ -105,7 +160,12 @@ async function main() {
     batchWindowMs: cfg.wake.groupWindowMs,
   });
 
-  /** @type {Map<string, NodeJS.Timeout>} 每个会话的合并定时器 */
+  const deps = { bot: null, brain, human, memory, waker };
+
+  // 私聊走会话窗口（群聊仍走 Waker.batch + 定时器）
+  const privateTurns = createPrivateTurnWindow({ deps, cfg, windowMs: cfg.wake.privateWindowMs });
+
+  /** @type {Map<string, NodeJS.Timeout>} 每个群会话的合并定时器 */
   const pending = new Map();
 
   const bot = new OneBot({
@@ -133,20 +193,26 @@ async function main() {
       }
       console.log('[醒·' + (verdict.reason || 'owner') + '] ' + msg.name + '：' + msg.text.slice(0, 60));
 
-      // 合并窗口：等人把话说完
-      const win = msg.isGroup ? cfg.wake.groupWindowMs : cfg.wake.privateWindowMs;
+      // 私聊：交给会话窗口，等对方把话说完再生成回复
+      if (!msg.isGroup) {
+        pushPrivateMessage(privateTurns, msg).catch(reportError);
+        return;
+      }
+
+      // 群聊合并窗口：等人把话说完
       clearTimeout(pending.get(msg.key));
       waker.batch(msg);
       pending.set(msg.key, setTimeout(() => {
         const items = waker.flush(msg.key);
         if (!items.length) return;
-        handleTurn({ bot, brain, human, memory, waker }, items, cfg)
-          .catch((e) => console.error('[出错] ' + (e?.message || e)));
-      }, win));
+        handleTurn(deps, items, cfg).catch(reportError);
+      }, cfg.wake.groupWindowMs));
     },
   });
 
-  process.on('unhandledRejection', (e) => console.error('[未处理] ' + (e?.message || e)));
+  deps.bot = bot;
+
+  process.on('unhandledRejection', (e) => reportError(e, '未处理'));
   process.on('SIGINT', () => { console.log('\n再见。'); process.exit(0); });
 
   console.log('在跑了。Ctrl+C 退出。\n');
@@ -178,5 +244,5 @@ export async function handleTurn({ bot, brain, human, memory, waker }, items, cf
 
 // 直接跑才启动；被 import 时不启动
 if (process.argv[1] && path.resolve(process.argv[1]) === path.resolve(fileURLToPath(import.meta.url))) {
-  main().catch((e) => { console.error('启动失败：' + (e?.stack || e)); process.exit(1); });
+  main().catch((e) => { reportError(e, '启动失败'); process.exit(1); });
 }
