@@ -21,6 +21,8 @@
  * packages/companion/src/agent-loop.js #classifyRestored。
  */
 
+import { TASK_STATUSES, TERMINAL_TASK_STATUSES } from './task-status.js';
+
 export const MAX_SCHEDULE_DELAY_MS = 7 * 24 * 60 * 60 * 1000;
 export const EXPIRE_AFTER_MS = 24 * 60 * 60 * 1000;
 
@@ -29,12 +31,8 @@ const SCHEDULABLE_STATUSES = new Set(['created', 'queued', 'due']);
 /** 已经触发过或结果未确认，只能待查、不能自动重发的状态。 */
 const PENDING_STATUSES = new Set(['processing', 'delivery_pending', 'unknown', 'pending']);
 /** 终态：优先保留，永不复活。 */
-const TERMINAL_STATUSES = new Set(['sent', 'partial', 'failed', 'canceled', 'expired']);
-const KNOWN_STATUSES = new Set([
-  ...SCHEDULABLE_STATUSES,
-  ...PENDING_STATUSES,
-  ...TERMINAL_STATUSES,
-]);
+const TERMINAL_STATUSES = new Set(TERMINAL_TASK_STATUSES);
+const KNOWN_STATUSES = new Set(TASK_STATUSES);
 
 function isPlainObject(value) {
   return Boolean(value) && typeof value === 'object' && !Array.isArray(value);
