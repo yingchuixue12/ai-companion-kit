@@ -15,6 +15,18 @@ const NIGHT = { from: 2, to: 7 };
 /** 打字速度：每字毫秒。中文手打大概 80~140ms/字，这里给个偏快的值 */
 const DEFAULT_MS_PER_CHAR = 85;
 
+/**
+ * 发送未被确认时的固定错误。
+ * 只带固定 code、状态和已成功段数；不带原始原因、正文和未发送段。
+ */
+function unconfirmedError(status, sent) {
+  const error = new Error('发送未确认');
+  error.code = 'delivery-unconfirmed';
+  error.status = status;
+  error.sent = sent;
+  return error;
+}
+
 export class Humanizer {
   /**
    * @param {object} opts
@@ -99,6 +111,33 @@ export class Humanizer {
   }
 
   /**
+   * 发一条并校验结果；未确认时立即抛错，不重试。
+   * 有回执时只认 confirmed，rejected/unknown/无法识别都算失败；
+   * 无回执时兼容旧回调，只有显式 ok:false 算失败。
+   *
+   * @param {(msg:string)=>Promise<any>} send
+   * @param {string} part
+   * @param {number} sent 此前已确认/兼容成功的段数
+   */
+  async #sendChecked(send, part, sent) {
+    let result;
+    try {
+      result = await send(part);
+    } catch {
+      throw unconfirmedError('unknown', sent);
+    }
+    const receipt = result && typeof result === 'object' ? result.receipt : null;
+    if (receipt != null) {
+      const status = typeof receipt === 'object' ? receipt.status : undefined;
+      if (status === 'confirmed') return;
+      throw unconfirmedError(status === 'rejected' ? 'rejected' : 'unknown', sent);
+    }
+    if (result && typeof result === 'object' && result.ok === false) {
+      throw unconfirmedError('unknown', sent);
+    }
+  }
+
+  /**
    * 执行一次拟人化发送
    *
    * @param {string|string[]} text        要说的话（字符串会被自动切分）
@@ -107,6 +146,8 @@ export class Humanizer {
    * @param {(msg:string)=>Promise<any>}  io.send          真正发一条
    * @param {(ms:number)=>Promise<void>}  [io.sleep]       等待（默认 setTimeout，测试时可注入）
    * @returns {Promise<{sent:number, parts:string[]}>}
+   * @throws {Error & {code:'delivery-unconfirmed', status:'rejected'|'unknown', sent:number}}
+   *   回执未确认时立即抛出；只带固定 code/status/sent，不带原因、正文或未发送段。
    */
   async say(text, { setTyping, send, sleep } = {}) {
     const wait = sleep || ((ms) => new Promise((r) => setTimeout(r, ms)));
@@ -114,8 +155,12 @@ export class Humanizer {
     if (!parts.length) return { sent: 0, parts: [] };
 
     if (!this.enabled) {
-      for (const p of parts) await send(p);
-      return { sent: parts.length, parts };
+      let sent = 0;
+      for (const p of parts) {
+        await this.#sendChecked(send, p, sent);
+        sent++;
+      }
+      return { sent, parts };
     }
 
     let sent = 0;
@@ -125,8 +170,8 @@ export class Humanizer {
       if (setTyping) { try { await setTyping(true); } catch { /* 有些平台不支持，忽略 */ } }
       await wait(this.typingMsFor(p));
       if (setTyping) { try { await setTyping(false); } catch {} }
-      // 2) 发出去
-      await send(p);
+      // 2) 发出去（回执不确认就立即停，不重试）
+      await this.#sendChecked(send, p, sent);
       sent++;
       // 3) 条间停顿
       if (i < parts.length - 1) await wait(this.gapMs());
