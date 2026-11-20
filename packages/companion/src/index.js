@@ -30,6 +30,7 @@ import { ConversationWindow } from './conversation-window.js';
 import { OneBot } from './transport-onebot.js';
 import { createPrivateTurnReplay } from './private-turn-replay.js';
 import { createReminderRuntime } from './reminder-runtime.js';
+import { createReminderCommands } from './reminder-commands.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -98,6 +99,57 @@ export function reportError(error, label) {
 
 // ── 私聊装配 ──────────────────────────────────────────────────
 /**
+ * 只在本进程显式开启提醒、非干跑、dataDir 有效时装配命令。
+ * bot 在 main 里稍后才赋值，send 只在真正发确认时读取 deps.bot。
+ */
+function configureReminderCommands(deps, cfg) {
+  if (!cfg?.reminders || cfg?.dryRun) return null;
+  const dataDir = typeof cfg.dataDir === 'string' ? cfg.dataDir.trim() : '';
+  if (!dataDir) return null;
+  return createReminderCommands({
+    dataDir,
+    ownerIds: cfg.ownerIds,
+    send: (userId, text) => deps?.bot?.sendPrivateText(userId, text),
+    onError: () => { console.error('[提醒] 命令处理失败'); },
+  });
+}
+
+/**
+ * 私聊批次统一出口：命令先在当前串行队列里处理，普通消息仍走原生成链。
+ * items / batch 由 ConversationWindow 冻结后交出，这里只读不写；需要拆分
+ * 时新建数组，原批次保持不变。混合批次生成失败只留档普通消息，重放不会
+ * 再执行命令。
+ */
+async function handlePrivateFlush({ deps, cfg, items, batch, commands, replay }) {
+  const plans = [];
+  const plain = [];
+  for (const item of items) {
+    const plan = commands?.classify(item);
+    if (plan) plans.push(plan);
+    else plain.push(item);
+  }
+
+  // 没有命令（或未开启命令）：保持原 items / batch 身份，沿用既有生成与留档。
+  if (!plans.length) {
+    return handleTurn(deps, items, cfg, {
+      // 只有 brain.reply 拒绝才会走到这里；原始异常仍由 handleTurn 重抛给 onError。
+      onGenerationError: () => { replay.remember({ items, batch }); },
+    });
+  }
+
+  // 已在窗口的每会话串行队列里，直接发确认，不再嵌套 runSerial。
+  for (const plan of plans) await commands.handle(plan);
+
+  if (!plain.length) return;
+
+  // 混合批次只把普通消息交给生成链；失败留档也只留这些消息。
+  const turnItems = Object.freeze(plain);
+  return handleTurn(deps, turnItems, cfg, {
+    onGenerationError: () => { replay.remember({ items: turnItems, batch }); },
+  });
+}
+
+/**
  * 私聊这一段的最小可测试装配：造一个会话窗口，刷出时把原消息交给现有 handleTurn。
  *
  * - 消息原样进窗口（窗口会把原文冻结后原样交回）；
@@ -120,11 +172,12 @@ export function createPrivateTurnWindow({ deps, cfg, windowMs, onError, maxFaile
     maxFailed: maxFailedPrivateTurns,
   });
 
+  const commands = configureReminderCommands(deps, cfg);
+
   const window = new ConversationWindow({
     windowMs: windowMs ?? cfg?.wake?.privateWindowMs ?? 1500,
-    onFlush: (items, batch) => handleTurn(deps, items, cfg, {
-      // 只有 brain.reply 拒绝才会走到这里；原始异常仍由 handleTurn 重抛给 onError。
-      onGenerationError: () => { replay.remember({ items, batch }); },
+    onFlush: (items, batch) => handlePrivateFlush({
+      deps, cfg, items, batch, commands, replay,
     }),
     onError: onError || reportError,
     onDrop: (reason) => console.error('[丢弃] 会话窗口已关闭（' + reason + '）'),
