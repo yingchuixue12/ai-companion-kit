@@ -15,6 +15,7 @@
  *   node src/index.js --config ./config.json
  *   node src/index.js --config ./config.json --dry-run   只打印，不真发
  *   node src/index.js --check                            只检查角色卡
+ *   node src/index.js --config ./config.json --reminders 开启提醒定时派发（默认关）
  */
 import fs from 'node:fs';
 import path from 'node:path';
@@ -28,11 +29,12 @@ import { Waker } from './wake.js';
 import { ConversationWindow } from './conversation-window.js';
 import { OneBot } from './transport-onebot.js';
 import { createPrivateTurnReplay } from './private-turn-replay.js';
+import { createReminderRuntime } from './reminder-runtime.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
 // ── 配置 ──────────────────────────────────────────────────────
-export function loadConfig(explicitPath) {
+export function loadConfig(explicitPath, argv = process.argv) {
   const file = explicitPath || path.join(__dirname, '..', 'config.json');
   let cfg = {};
   try { cfg = JSON.parse(fs.readFileSync(file, 'utf8')); }
@@ -67,7 +69,8 @@ export function loadConfig(explicitPath) {
     },
 
     humanize: cfg.humanize || {},
-    dryRun: process.argv.includes('--dry-run'),
+    reminders: argv.includes('--reminders'),
+    dryRun: argv.includes('--dry-run'),
   };
 }
 
@@ -142,9 +145,14 @@ export function pushPrivateMessage(window, msg) {
 }
 
 // ── 主程序 ────────────────────────────────────────────────────
-async function main() {
-  const cfgIdx = process.argv.indexOf('--config');
-  const cfg = loadConfig(cfgIdx >= 0 ? process.argv[cfgIdx + 1] : null);
+export async function main({ createBot, proc: injectedProc, process: injectedProcess } = {}) {
+  // 默认维持当前运行方式；离线验证时只替换 bot 构造与进程对象。
+  const proc = injectedProc || injectedProcess || process;
+  const argv = Array.isArray(proc?.argv) ? proc.argv : process.argv;
+  const buildBot = typeof createBot === 'function' ? createBot : (options) => new OneBot(options);
+
+  const cfgIdx = argv.indexOf('--config');
+  const cfg = loadConfig(cfgIdx >= 0 ? argv[cfgIdx + 1] : null, argv);
 
   console.log('════════ companion ════════');
   console.log('  模型      ' + cfg.model + ' @ ' + cfg.baseUrl);
@@ -154,6 +162,7 @@ async function main() {
   console.log('  名字      ' + (cfg.names.join(' / ') || '（没配）'));
   console.log('  主人      ' + (cfg.ownerIds.join(', ') || '（没配）'));
   console.log('  干跑      ' + (cfg.dryRun ? '是（不会真发）' : '否'));
+  console.log('  提醒      ' + (cfg.reminders ? (cfg.dryRun ? '开（干跑不启动）' : '开') : '关'));
   console.log('');
 
   const memory = new Memory({ dir: cfg.dataDir });
@@ -166,7 +175,7 @@ async function main() {
     lint.warn.forEach((w) => console.log('   · ' + w));
     console.log('');
   }
-  if (process.argv.includes('--check')) { console.log('检查完毕。'); return; }
+  if (argv.includes('--check')) { console.log('检查完毕。'); return; }
   if (!cfg.apiKey) console.log('⚠️ 没配 apiKey，模型调用会失败\n');
 
   const brain = new Brain({ apiKey: cfg.apiKey, baseUrl: cfg.baseUrl, model: cfg.model, role, memory });
@@ -187,7 +196,7 @@ async function main() {
   /** @type {Map<string, NodeJS.Timeout>} 每个群会话的合并定时器 */
   const pending = new Map();
 
-  const bot = new OneBot({
+  const bot = buildBot({
     ...cfg.onebot,
     onMessage: (msg) => {
       // 第一次见到这个会话 → 给个默认策略
@@ -231,10 +240,32 @@ async function main() {
 
   deps.bot = bot;
 
-  process.on('unhandledRejection', (e) => reportError(e, '未处理'));
-  process.on('SIGINT', () => { console.log('\n再见。'); process.exit(0); });
+  // 宿主定时运转：显式 --reminders 且非干跑才启动。没有有效白名单时
+  // runtime 自己不会排定时器，也不碰 bot；干跑连 runtime 都不建。
+  /** @type {ReturnType<typeof createReminderRuntime>|null} */
+  let reminders = null;
+  if (cfg.reminders && !cfg.dryRun) {
+    reminders = createReminderRuntime({
+      bot,
+      window: privateTurns,   // 与普通私聊批次共用同一条每会话串行队列
+      ownerIds: cfg.ownerIds,
+      dataDir: cfg.dataDir,   // → <dataDir>/reminders.json
+    });
+    reminders.start();
+    if (!reminders.active) console.log('[提醒] 没有有效主人白名单，不启动调度');
+  }
+
+  proc.on('unhandledRejection', (e) => reportError(e, '未处理'));
+  proc.on('SIGINT', () => {
+    // 先停调度，再按原来的方式退出。
+    reminders?.stop();
+    console.log('\n再见。');
+    if (typeof proc.exit === 'function') proc.exit(0);
+    else process.exit(0);
+  });
 
   console.log('在跑了。Ctrl+C 退出。\n');
+  return { bot, reminders };
 }
 
 /**
