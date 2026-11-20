@@ -75,7 +75,13 @@ export class Role {
 
     const card = this.read();
     if (card) {
-      const room = Math.max(0, this.maxChars - parts.join('\n\n').length);
+      // 截断额度只由稳定层（自述笔记 / 基本规矩 / extra）决定；
+      // situation / memory / recent 这些参考块再长也不挤占角色卡。
+      const stable = [];
+      if (ctx.selfNote) stable.push(ctx.selfNote.trim());
+      stable.push(BASE_RULES);
+      if (this.extra) stable.push(this.extra.trim());
+      const room = Math.max(0, this.maxChars - stable.join('\n\n').length);
       parts.push('【完整设定】\n' + (card.length > room ? card.slice(0, room) : card));
     }
     if (ctx.platform) parts.push('【平台给你的说明】\n' + ctx.platform.trim());

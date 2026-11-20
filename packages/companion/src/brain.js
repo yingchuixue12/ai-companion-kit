@@ -11,6 +11,16 @@
  */
 import { Memory } from './memory.js';
 import { Role } from './role.js';
+import { planContextBudget } from './context-budget.js';
+
+/** 请求体超预算时抛出的错误：只带计数，不带任何正文 */
+function contextOverflow(maxInputChars, inputChars) {
+  const error = new Error('输入超出上下文预算：请求体 ' + inputChars + ' 字符 > 上限 ' + maxInputChars);
+  error.code = 'context-budget-overflow';
+  error.maxInputChars = maxInputChars;
+  error.inputChars = inputChars;
+  return error;
+}
 
 export class Brain {
   /**
@@ -19,14 +29,19 @@ export class Brain {
    * @param {string}  [opts.baseUrl]   默认 https://api.deepseek.com/v1
    * @param {string}  [opts.model]     默认 deepseek-chat
    * @param {number}  [opts.timeoutMs] 默认 120000
+   * @param {number}  [opts.maxInputChars] 序列化请求体长度上限，默认 24000（正安全整数）
    * @param {Role}    opts.role
    * @param {Memory}  opts.memory
    */
-  constructor({ apiKey, baseUrl = 'https://api.deepseek.com/v1', model = 'deepseek-chat', timeoutMs = 120000, role, memory }) {
+  constructor({ apiKey, baseUrl = 'https://api.deepseek.com/v1', model = 'deepseek-chat', timeoutMs = 120000, maxInputChars = 24000, role, memory }) {
+    if (!Number.isSafeInteger(maxInputChars) || maxInputChars <= 0) {
+      throw new TypeError('maxInputChars 必须是正安全整数，收到：' + String(maxInputChars));
+    }
     this.apiKey = apiKey;
     this.baseUrl = baseUrl.replace(/\/+$/, '');
     this.model = model;
     this.timeoutMs = timeoutMs;
+    this.maxInputChars = maxInputChars;
     this.role = role || new Role({ cardPath: 'role.md' });
     this.memory = memory || new Memory({ dir: './data' });
   }
@@ -49,23 +64,39 @@ export class Brain {
 
     const memLine = this.memory.renderPerson(userId);
     const recent = this.memory.renderRecent(20, { excludeWhere: key });
-    const sys = this.role.build({
-      situation,
-      memory: memLine,
-      recent,
-      platform: input.platform || '',
-    });
+    // 一次装配：system prompt + 独立 history + 用户原文；预算与 fetch 共用同一份序列化结果
+    const payload = (parts) => {
+      const sys = this.role.build({
+        situation: parts.situation,
+        memory: parts.memory,
+        recent: parts.recent,
+        platform: input.platform || '',
+      });
+      const messages = [{ role: 'system', content: sys }];
+      for (const h of history.slice(-20)) {
+        messages.push({ role: h.isSelf ? 'assistant' : 'user', content: String(h.text || '') });
+      }
+      messages.push({ role: 'user', content: String(text || '') });
+      return { model: this.model, messages, temperature: 1.1, stream: false };
+    };
 
-    const messages = [{ role: 'system', content: sys }];
-    for (const h of history.slice(-20)) {
-      messages.push({ role: h.isSelf ? 'assistant' : 'user', content: String(h.text || '') });
+    const parts = { situation, memory: memLine, recent };
+    let body = JSON.stringify(payload(parts));
+    if (body.length > this.maxInputChars) {
+      // 超限：按 recent → memory → situation 整块丢弃（platform / history / 用户原文不动）
+      const plan = planContextBudget({
+        measure: (candidate) => JSON.stringify(payload(candidate)).length,
+        parts,
+        maxChars: this.maxInputChars,
+      });
+      body = JSON.stringify(payload(plan.parts));
+      if (body.length > this.maxInputChars) throw contextOverflow(this.maxInputChars, body.length);
     }
-    messages.push({ role: 'user', content: String(text || '') });
 
     const res = await fetch(this.baseUrl + '/chat/completions', {
       method: 'POST',
       headers: { 'content-type': 'application/json', authorization: 'Bearer ' + this.apiKey },
-      body: JSON.stringify({ model: this.model, messages, temperature: 1.1, stream: false }),
+      body,
       signal: AbortSignal.timeout(this.timeoutMs),
     });
     const raw = await res.text();
