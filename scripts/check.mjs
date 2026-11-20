@@ -9,10 +9,14 @@
  */
 import fs from 'node:fs';
 import path from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import { execFileSync } from 'node:child_process';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
+// 用 pathToFileURL 构造 import 地址，不要手拼 file:///
+// （UNC 路径如 \\wsl.localhost\...\ 手拼会把 \\ 变成 file://///，抛
+//  "File URL path must be absolute"，WSL 里跑真实 Run 时必炸）。
+const LIB_URL = pathToFileURL(path.join(ROOT, 'packages', 'companion', 'src', 'lib.js')).href;
 let pass = 0, fail = 0, warn = 0;
 
 function ok(msg) { console.log('  ✅ ' + msg); pass++; }
@@ -47,7 +51,7 @@ for (const f of jsFiles) {
 // ── ② 能 import ────────────────────────────────────────────────
 head('模块导入');
 try {
-  const lib = await import(path.join(ROOT, 'packages/companion/src/lib.js').replace(/\\/g, '/').replace(/^/, 'file:///'));
+  const lib = await import(LIB_URL);
   const need = ['Memory', 'Role', 'Brain', 'Humanizer', 'Waker'];
   for (const n of need) {
     if (typeof lib[n] === 'function') ok('companion 导出 ' + n);
@@ -60,9 +64,7 @@ try {
 // ── ③ 功能冒烟 ─────────────────────────────────────────────────
 head('功能冒烟');
 try {
-  const { Memory, Humanizer, Waker } = await import(
-    path.join(ROOT, 'packages/companion/src/lib.js').replace(/\\/g, '/').replace(/^/, 'file:///')
-  );
+  const { Memory, Humanizer, Waker } = await import(LIB_URL);
 
   // 唤醒
   // probability: 0 —— 关掉「普通消息按概率随机插话」。Waker 默认 probability=0.05，
