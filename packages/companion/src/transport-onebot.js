@@ -37,6 +37,38 @@ function findReply(segs) {
   return null;
 }
 
+/** message_id 是否可用于确认：非空非零字符串，或非零安全整数 */
+function usableMessageId(value) {
+  if (typeof value === 'string') {
+    const s = value.trim();
+    return s !== '' && s !== '0';
+  }
+  return Number.isSafeInteger(value) && value !== 0;
+}
+
+/** 把 api() 结果规范化成发送回执，只带状态和确认的 ID */
+function normalizeSendReceipt(result) {
+  const unknown = { status: 'unknown' };
+  const env = result.data;
+  if (!env || typeof env !== 'object') return unknown;
+
+  const id = usableMessageId(env.data?.message_id)
+    ? (typeof env.data.message_id === 'string' ? env.data.message_id.trim() : String(env.data.message_id))
+    : null;
+
+  // 只有 HTTP 成功且信封合法、message_id 可用，才算确认送达
+  if (result.ok === true && env.status === 'ok' && env.retcode === 0) {
+    return id === null ? unknown : { status: 'confirmed', messageId: id };
+  }
+
+  // 信封明确失败、retcode 为非零整数且没有可用 ID，才算被拒绝
+  if (env.status === 'failed' && Number.isInteger(env.retcode) && env.retcode !== 0 && id === null) {
+    return { status: 'rejected' };
+  }
+
+  return unknown;
+}
+
 export class OneBot {
   /**
    * @param {object} opts
@@ -130,15 +162,22 @@ export class OneBot {
     }
   }
 
-  /** 发一条纯文本 */
-  send(key, text, { atUserId } = {}) {
+  /**
+   * 发一条纯文本
+   * @param {string} key
+   * @param {string} text
+   * @param {{atUserId?:string}} [opts]
+   * @returns {Promise<{ok:boolean, data?:object, error?:string, receipt:{status:'confirmed'|'rejected'|'unknown', messageId?:string}}>}
+   */
+  async send(key, text, { atUserId } = {}) {
     const isGroup = key.startsWith('group:');
     const id = key.split(':')[1];
     let message = String(text);
     if (atUserId) message = '[CQ:at,qq=' + atUserId + '] ' + message;
-    return isGroup
+    const result = await (isGroup
       ? this.api('send_group_msg', { group_id: id, message })
-      : this.api('send_private_msg', { user_id: id, message });
+      : this.api('send_private_msg', { user_id: id, message }));
+    return { ...result, receipt: normalizeSendReceipt(result) };
   }
 
   /** 发一张图（本地文件或 URL） */
