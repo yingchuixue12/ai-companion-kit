@@ -16,7 +16,11 @@
  *   已经冻结的上下文，晚到的消息只会进入下一批；
  * - 关闭（close）算一次轮次边界：计时器还没到的待处理消息会被照常交出，不丢；
  *   关闭之后仍有消息进来时通过 onDrop('closed', …) 显式报告，不静默吞掉；
- * - 同一会话串行：上一批还没处理完时，下一批排队等待，不会并发改写同一份历史。
+ * - 同一会话串行：上一批还没处理完时，下一批排队等待，不会并发改写同一份历史；
+ * - runSerial(key, job) 与批次共用同一条每 key 串行队列：显式 job 的返回值/异常
+ *   交给调用者，不走 onError；它不会提前刷出窗口，也不会碰 pending 中的消息。
+ *   关闭开始之后新的 runSerial 会被拒绝（code 为 'window-closed'），已经排队的
+ *   显式 job 和待刷批次则由 close 等到落定。
  */
 const DEFAULT_MAX_SEEN = 512;
 
@@ -35,6 +39,12 @@ function toIsoTime(value) {
 function snapshotItem(item) {
   if (!item || typeof item !== 'object') return item;
   return Object.freeze(Array.isArray(item) ? [...item] : { ...item });
+}
+
+function closedError() {
+  const error = new Error('conversation window is closed');
+  error.code = 'window-closed';
+  return error;
 }
 
 export class ConversationWindow {
@@ -98,6 +108,22 @@ export class ConversationWindow {
     return [...this.entries.keys()];
   }
 
+  /**
+   * 在会话的串行队列里跑一件显式工作，与 flush 共用每 key FIFO。
+   * job 的返回值原样交给调用者，抛错/拒绝也由调用者处理，不触发 onError。
+   * 只排队，不刷出窗口里的待处理消息；跨 key 依旧并行。
+   * @param {string} key 会话键
+   * @param {() => any} job 要串行执行的工作
+   * @returns {Promise<any>}
+   */
+  runSerial(key, job) {
+    if (this.closing) return Promise.reject(closedError());
+    if (typeof job !== 'function') {
+      return Promise.reject(new TypeError('runSerial requires a job function'));
+    }
+    return this.#enqueue(key, job);
+  }
+
   flush(key) {
     const entry = this.entries.get(key);
     if (!entry) return Promise.resolve();
@@ -117,19 +143,10 @@ export class ConversationWindow {
       if (entry.eligible) return this.onFlush?.(items, batch);
       return this.onIgnore?.(items, batch);
     };
-    const previous = this.tails.get(key) || Promise.resolve();
-    // Timer-triggered flushes have no caller waiting on them. Report failures
-    // here so a model/send error cannot become an unhandled rejection.
-    const current = previous.catch(() => {}).then(job);
-    const settled = current.catch((error) => {
+    // 批次失败只报告给 onError，返回的 promise 始终 resolve；队列本身不会 reject。
+    return this.#enqueue(key, job, (error) => {
       try { this.onError?.(error, { key, items, batch }); } catch { /* logging must not break the queue */ }
     });
-    let tail;
-    tail = settled.finally(() => {
-      if (this.tails.get(key) === tail) this.tails.delete(key);
-    });
-    this.tails.set(key, tail);
-    return settled;
   }
 
   close() {
@@ -139,6 +156,20 @@ export class ConversationWindow {
     // silently discarded just because their debounce timer has not fired.
     const pending = [...this.entries.keys()].map((key) => this.flush(key));
     return Promise.allSettled([...pending, ...this.tails.values()]);
+  }
+
+  /**
+   * 每 key 队尾调度：tail 永远 fulfilled，上一个任务成败都不阻塞下一个。
+   * report 为空时把结果/错误原样交给调用者；否则错误交给 report 并 resolve。
+   */
+  #enqueue(key, job, report) {
+    const previous = this.tails.get(key) || Promise.resolve();
+    const current = previous.then(job);
+    const settled = report ? current.catch(report) : current;
+    const release = () => { if (this.tails.get(key) === tail) this.tails.delete(key); };
+    const tail = settled.then(release, release);
+    this.tails.set(key, tail);
+    return settled;
   }
 
   #identify(key, item, { eventId, sequence, receivedAt }) {
