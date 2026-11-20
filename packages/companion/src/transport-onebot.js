@@ -180,6 +180,21 @@ export class OneBot {
     return { ...result, receipt: normalizeSendReceipt(result) };
   }
 
+  /**
+   * 发一条私聊纯文本；正文原样作为单个 text 消息段，不裁剪、不改写。
+   * 与 send() 一样走 api()，回执原样复用 normalizeSendReceipt()；不影响 send()。
+   * @param {string} userId 目标用户 ID
+   * @param {string} text 正文
+   * @returns {Promise<{ok:boolean, data?:object, error?:string, receipt:{status:'confirmed'|'rejected'|'unknown', messageId?:string}}>}
+   */
+  async sendPrivateText(userId, text) {
+    const result = await this.api('send_private_msg', {
+      user_id: userId,
+      message: [{ type: 'text', data: { text } }],
+    });
+    return { ...result, receipt: normalizeSendReceipt(result) };
+  }
+
   /** 发一张图（本地文件或 URL） */
   sendImage(key, file) {
     const isGroup = key.startsWith('group:');
