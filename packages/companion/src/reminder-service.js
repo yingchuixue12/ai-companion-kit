@@ -31,9 +31,11 @@
  *     { ok:false, error:'invalid-clock' }          now() 非安全整数 / 相加溢出
  *     { ok:false, error:'invalid-task-id' }        newId() 不可用
  *
- * ── list(conversationKey) ───────────────────────────────────
- *   只返回 conversationKey 完全相等的记录。排序为 dueAt 升序，dueAt 相同
- *   时按 taskId 的码元顺序稳定破同分；最多返回 20 条，超过时 truncated:true。
+ * ── list(conversationKey, {pendingOnly}) ────────────────────
+ *   只返回 conversationKey 完全相等的记录。默认返回全部状态；传
+ *   {pendingOnly:true} 时只保留 created/queued/due，并在排序与截断前过滤。
+ *   排序为 dueAt 升序，dueAt 相同时按 taskId 的码元顺序稳定破同分；
+ *   最多返回 20 条，超过时 truncated:true。
  *     { ok:true, reminders:[{taskId,text,dueAt,status}], truncated:boolean }
  *   attempt / firedAt / proactive 属于投递内部事实，conversationKey 属于
  *   会话边界，都不出现在公开列表里。
@@ -64,8 +66,8 @@ const MAX_IDENTIFIER_LENGTH = 128;
 /** list 一次最多返回多少条。 */
 const MAX_LISTED_REMINDERS = 20;
 
-/** 仍可取消、且尚未触发过的状态。 */
-const CANCELABLE_STATUSES = new Set(['created', 'queued', 'due']);
+/** 待提醒状态；cancel 另外还要求尚未触发过。 */
+const PENDING_STATUSES = new Set(['created', 'queued', 'due']);
 
 /** 统一的失败结果；store 的错误不走这里，而是原样返回。 */
 function failure(error) {
@@ -180,9 +182,10 @@ export function createReminderService(file, { now = Date.now, newId = randomUUID
    * 列出当前会话的提醒；dueAt 升序，最多 20 条。
    *
    * @param {string} conversationKey 当前会话键
+   * @param {{pendingOnly?: boolean}} [options] 只返回 created/queued/due
    * @returns {object} 成功 {ok:true,reminders,truncated}；失败 {ok:false,error}
    */
-  function list(conversationKey) {
+  function list(conversationKey, { pendingOnly = false } = {}) {
     if (!isValidIdentifier(conversationKey)) {
       return failure('invalid-conversation-key');
     }
@@ -191,7 +194,8 @@ export function createReminderService(file, { now = Date.now, newId = randomUUID
     if (!loaded.ok) return loaded;
 
     const reminders = loaded.records
-      .filter((record) => record.conversationKey === conversationKey)
+      .filter((record) => record.conversationKey === conversationKey
+        && (!pendingOnly || PENDING_STATUSES.has(record.status)))
       .sort(compareReminders);
     const truncated = reminders.length > MAX_LISTED_REMINDERS;
 
@@ -231,7 +235,7 @@ export function createReminderService(file, { now = Date.now, newId = randomUUID
     }
 
     const notFired = record.attempt === 0 && record.firedAt === null;
-    if (!CANCELABLE_STATUSES.has(record.status) || !notFired) {
+    if (!PENDING_STATUSES.has(record.status) || !notFired) {
       return failure('not-cancelable');
     }
 
