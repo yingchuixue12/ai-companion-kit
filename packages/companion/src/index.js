@@ -27,6 +27,7 @@ import { Humanizer } from './humanize.js';
 import { Waker } from './wake.js';
 import { ConversationWindow } from './conversation-window.js';
 import { OneBot } from './transport-onebot.js';
+import { createPrivateTurnReplay } from './private-turn-replay.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -101,17 +102,35 @@ export function reportError(error, label) {
  * - 窗口时长用原 cfg 的 privateWindowMs；
  * - 去重：OneBot messageId 非空时，按会话作用域放进独立命名空间；
  *   没有 id 就不传，交给模块自己按 `会话key#序号` 分配；
- * - 失败统一由窗口的 onError 报告，不在这里重复 try/catch，也不挡后续消息。
+ * - 失败统一由窗口的 onError 报告，不在这里重复 try/catch，也不挡后续消息；
+ * - 宿主专用：failedPrivateTurns(key) 只列生成阶段失败的原批次元数据，
+ *   replayPrivateTurn(key, batchId) 用 window.runSerial 串行重放同一批。
+ *   这两个入口不改变普通私聊的刷出/发送/落账行为。
  *
- * @param {{deps: object, cfg: object, windowMs?: number, onError?: (e: unknown) => void}} opts
+ * @param {{deps: object, cfg: object, windowMs?: number, onError?: (e: unknown) => void, maxFailedPrivateTurns?: number}} opts
  */
-export function createPrivateTurnWindow({ deps, cfg, windowMs, onError } = {}) {
-  return new ConversationWindow({
+export function createPrivateTurnWindow({ deps, cfg, windowMs, onError, maxFailedPrivateTurns } = {}) {
+  // replay 只负责“留档 / 列元数据 / 串行再跑一次”，真正的生成仍是 handleTurn。
+  const replay = createPrivateTurnReplay({
+    runSerial: (key, job) => window.runSerial(key, job),
+    runTurn: (record, hooks) => handleTurn(deps, record.items, cfg, hooks),
+    maxFailed: maxFailedPrivateTurns,
+  });
+
+  const window = new ConversationWindow({
     windowMs: windowMs ?? cfg?.wake?.privateWindowMs ?? 1500,
-    onFlush: (items) => handleTurn(deps, items, cfg),
+    onFlush: (items, batch) => handleTurn(deps, items, cfg, {
+      // 只有 brain.reply 拒绝才会走到这里；原始异常仍由 handleTurn 重抛给 onError。
+      onGenerationError: () => { replay.remember({ items, batch }); },
+    }),
     onError: onError || reportError,
     onDrop: (reason) => console.error('[丢弃] 会话窗口已关闭（' + reason + '）'),
   });
+
+  // 宿主专用入口：不通过 lib.js 导出，也不进入模型上下文。
+  window.failedPrivateTurns = (key) => replay.list(key);
+  window.replayPrivateTurn = (key, batchId) => replay.replay(key, batchId);
+  return window;
 }
 
 /** 把一条 OneBot 私聊消息推进窗口（外部 id 与窗口自动 id 分属不同命名空间）。 */
@@ -218,8 +237,23 @@ async function main() {
   console.log('在跑了。Ctrl+C 退出。\n');
 }
 
-/** 处理一轮（可能是合并后的多条） */
-export async function handleTurn({ bot, brain, human, memory, waker }, items, cfg) {
+/**
+ * 处理一轮（可能是合并后的多条）。
+ *
+ * 可选的第四个参数只给宿主/装配层用：
+ * - onGenerationError：仅 Brain.reply 拒绝时调用，之后仍重抛原异常；
+ * - onGenerationSuccess：Brain.reply 成功时调用，供重放层移除记录。
+ * 发送、静默、干跑、提交等后续阶段的异常不经过 onGenerationError。
+ *
+ * @param {object} deps
+ * @param {any[]} items
+ * @param {object} cfg
+ * @param {{onGenerationError?: () => void, onGenerationSuccess?: () => void}} [options]
+ */
+export async function handleTurn({ bot, brain, human, memory, waker }, items, cfg, {
+  onGenerationError,
+  onGenerationSuccess,
+} = {}) {
   const last = items[items.length - 1];
   const key = last.key;
   const text = Waker.joinBatch(items);
@@ -229,7 +263,18 @@ export async function handleTurn({ bot, brain, human, memory, waker }, items, cf
     : '你在跟 ' + last.name + ' 私聊。';
 
   // deferred：这一轮先不写记忆，等真的发出去了（Humanizer 完成且 sent > 0）再一次性提交
-  const { text: out, commit } = await brain.reply({ key, userId: last.userId, userName: last.name, text, situation, record: 'deferred' });
+  let result;
+  try {
+    result = await brain.reply({ key, userId: last.userId, userName: last.name, text, situation, record: 'deferred' });
+  } catch (error) {
+    // 只包住生成阶段：原始异常原样重抛，现有 onError 语义不变。
+    onGenerationError?.();
+    throw error;
+  }
+
+  onGenerationSuccess?.();
+
+  const { text: out, commit } = result;
   if (!out) { console.log('   （没说话）'); return; }
 
   if (cfg.dryRun) { console.log('   [干跑] 会说：' + out); return; }
