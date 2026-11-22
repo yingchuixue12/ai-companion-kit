@@ -48,6 +48,7 @@ import { createMediaStore } from '../../packages/companion/src/media/store.js';
 import { createToolHostBridge, createVoiceRuntime } from '../../packages/companion/src/lib.js';
 
 import { C_NOT_COVERED, C_SCENARIOS } from './presence-scenarios.mjs';
+import { OWNER_PRIVATE_SCENARIOS } from './owner-private-scenarios.mjs';
 
 /** 合成会话键 / 对方 id：全部是占位值，不对应任何真实账号。 */
 const KEY = 'private:visitor-1';
@@ -2912,22 +2913,35 @@ async function runE05(harness) {
 /**
  * 未覆盖项：依赖本 checkout 里不存在的宿主集成 / QQ 集成 / Web presence 宿主。
  * 按 id 建索引（不按下标），增删一条不会让场景表悄悄错位。
+ *
+ * B-14 / B-18 有 X-07 的**通用入口旁证**，但仍缺宿主/真实 QQ 集成路径；
+ * `proofRequired` 记录还差什么，`corroboratedBy` 只指向旁证，不改变 not-covered。
  */
 const NOT_COVERED = Object.freeze(Object.fromEntries([
   ['B-03', 'requires-host-integration'],
   ['B-04', 'requires-host-integration'],
   ['B-05', 'requires-qq-integration'],
   ['B-12', 'requires-host-integration'],
-  ['B-14', 'requires-qq-integration'],
+  ['B-14', 'requires-qq-integration', [
+    '宿主/QQ 集成路径：真实 QQ 群聊关闭、非 owner 私聊拒绝、白名单私聊成功',
+    'X-07 只覆盖公开通用 CLI + 合成 OneBot 的入口子场景，不能代替真实平台收发',
+    'T9 真实 QQ 验收仍需人工执行，不能把芙兰宿主或真实 QQ 记完成',
+  ]],
   ['B-15', 'requires-host-integration'],
-  ['B-18', 'requires-host-integration'],
-].map(([id, reason]) => [id, {
+  ['B-18', 'requires-host-integration', [
+    '宿主集成路径：宿主自己的 owner 白名单 / 群聊开关配置在缺失或非法时 fail-closed',
+    'X-07 只覆盖公开通用 CLI 的配置闸门，不是芙兰宿主的配置装载路径',
+    '真实配置错误仍需在接触运输/存储前退出的宿主级证据（T9/宿主验收）',
+  ]],
+].map(([id, reason, proofRequired]) => [id, {
   id,
   gate: 'b',
   status: 'not-covered',
   title: '未覆盖：依赖缺失的宿主/QQ 集成源码',
   reason,
-  requires: '宿主集成路径或 QQ/OneBot 集成路径（本 checkout 不存在）',
+  requires: '宿主集成路径或 QQ/OneBot 集成路径（本 checkout 不存在；X-07 只是通用入口旁证）',
+  proofRequired: proofRequired ?? [],
+  corroboratedBy: proofRequired ? ['X-07'] : [],
 }])));
 
 /**
@@ -2977,6 +2991,8 @@ export const SCENARIOS = Object.freeze([
   { id: 'X-04', aliases: ['media-pipeline-offline'], gate: 'extra', status: 'covered', title: 'X-04（增补）离线媒体：低置信度不写记忆、临时音频删除审计、TTS 失败保留文字', run: runX04 },
   { id: 'X-05', aliases: ['presence-qq-runtime'], gate: 'extra', status: 'covered', title: 'X-05（增补）离线 QQ presence runtime：白名单闸门、唯一 owner 欢迎、状态文件白名单、重启冷却/台账、私聊不自指、群聊不触发', run: runX05 },
   { id: 'X-06', aliases: ['onebot-reconnect'], gate: 'extra', status: 'covered', title: 'X-06（增补）通用 CLI 的 OneBot 重连与去重', run: runX06 },
+  // X-07 只把 #95 的 --owner-private 接入通用 CLI 行为接进矩阵；B-14/B-18 仍是 not-covered。
+  ...OWNER_PRIVATE_SCENARIOS,
   // D-01…D-04 / E-01…E-05 是执行计划 §9.3 的独立验收项；与 X-01/X-03/X-04 的增补旁证区分，不复用同一 ID。
   { id: 'D-01', aliases: ['asr-success'], gate: 'extra', status: 'covered', title: 'D-01 离线 ASR 成功（桩）：转写/置信度/元数据；无 memory port 不写长期记忆', run: runD01 },
   { id: 'D-02', aliases: ['asr-failure'], gate: 'extra', status: 'covered', title: 'D-02 ASR 失败（桩）：asr-failed + ask-repeat，保留元数据', run: runD02 },

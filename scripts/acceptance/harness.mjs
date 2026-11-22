@@ -982,6 +982,9 @@ export async function runScenario(id, { harness, scenarioOptions, registry } = {
       artifacts: {
         notes: [scenario.title],
         requirements: [scenario.requires].filter(Boolean),
+        // 旁证与仍需的证据分开记：not-covered 不能因为有个 X 场景就当成通过。
+        corroboratedBy: Array.isArray(scenario.corroboratedBy) ? scenario.corroboratedBy : [],
+        proofRequired: Array.isArray(scenario.proofRequired) ? scenario.proofRequired : [],
         // 没执行就没有产物：字段照样给，值是空数组（"没有证据"要能被机读区分）。
         tempFiles: [],
       },
