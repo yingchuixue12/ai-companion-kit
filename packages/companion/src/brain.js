@@ -10,7 +10,7 @@
  * 也不关心怎么发出去（那是 transport 的事）。
  */
 import { Memory } from './memory.js';
-import { Role } from './role.js';
+import { Role, normalizeTaskReferences } from './role.js';
 import { planContextBudget } from './context-budget.js';
 
 /**
@@ -22,8 +22,11 @@ const RECENT_TURN_LIMIT = 20;
 /** memory-budget 诊断事件的字段版本：字段增删都要改它，消费方据此判断兼容性。 */
 export const MEMORY_BUDGET_EVENT_VERSION = 1;
 
-/** 诊断里「被整块淘汰」的块名顺序：与 `DEFAULT_DROP_ORDER` 一致，只报块名不报正文。 */
-const EVICTION_ORDER = Object.freeze(['recent', 'memory', 'situation']);
+/**
+ * 诊断里「被整块淘汰」的块名顺序：与 P-3 一致（recent → memory → situation → L6 任务引用），
+ * 只报固定块名，不报正文。`taskReferences` 只有明确注入时才会出现，旧请求的事件形状不变。
+ */
+const EVICTION_ORDER = Object.freeze(['recent', 'memory', 'situation', 'taskReferences']);
 
 /** 记忆块提供者只接受函数；其它值当作没接（保持接线前行为）。 */
 function resolveMemoryBlocks(provider) {
@@ -37,6 +40,7 @@ function resolveBudgetReporter(reporter) {
 
 /** 块是否「空」：只有空/缺失才算被淘汰，非字符串沿用现有的真值判断。 */
 function isEmptyBlock(value) {
+  if (Array.isArray(value)) return value.length === 0;
   return typeof value === 'string' ? value.length === 0 : !value;
 }
 
@@ -68,6 +72,8 @@ export class Brain {
    *   `{ event:'memory-budget', version, maxChars, charsUsed, withinBudget,
    *      roundsAvailable, roundsKept, roundsDropped, topicsDropped,
    *      blocksEvicted, evictedParts }`——只有块名和纯计数，不含输入、异常原文、会话标识或任何 prompt。
+   *   `evictedParts` 可能出现的固定块名：`recent` / `memory` / `situation` / `taskReferences`；
+   *   只有本轮明确注入任务引用时才会出现 `taskReferences`，旧请求的字段与取值不变。
    *   回调失败（同步抛错或 reject）不影响本轮；不等待它完成，也不改网络/记忆行为。
    *   不接回调时行为与接线前完全一致。
    */
@@ -110,6 +116,10 @@ export class Brain {
    * @param {string} [input.userName]
    * @param {string} input.text        对方说的话（可以是合并后的一批）
    * @param {string} [input.situation] 处境描述（"你在群里，刚才在聊……"）
+   * @param {string|Array<string|{text:string}>} [input.taskReferences]
+   *   可选的宿主已验证 L6 任务引用（不是长期记忆）：非空时由 Role 放进独立固定块；
+   *   Brain 只按预算淘汰和上报块名，不读任务文件、不推断 pending、不接宿主源。
+   *   不传 / 空数组 / 全是空白时，请求体与接入前逐字节一致。
    * @param {Array}  [input.history]   该会话最近的消息（可选，通常靠 memory 就够）
    * @param {boolean|'deferred'} [input.record=true] 是否把这一轮写回记忆；
    *   'deferred' 表示此刻先不写，改在返回对象上给一个一次性 commit()，由调用方决定提交时机
@@ -117,6 +127,8 @@ export class Brain {
    */
   async reply(input) {
     const { key, userId, userName, text, situation = '', history = [], record = true } = input;
+    // L6 任务引用是可选输入：只整理形状，不做持久化、不读任务文件、不猜任务状态。
+    const taskReferences = normalizeTaskReferences(input.taskReferences);
     const deferred = record === 'deferred';
     const shouldRecord = record && !deferred;
 
@@ -129,12 +141,16 @@ export class Brain {
     const recent = recentView ? recentView.text : this.memory.renderRecent(RECENT_TURN_LIMIT, { excludeWhere: key });
     // 一次装配：system prompt + 独立 history + 用户原文；预算与 fetch 共用同一份序列化结果
     const payload = (parts) => {
-      const sys = this.role.build({
+      // 没有非空 L6 引用时保持接入前的 role.build 入参形状：自定义角色适配器可能按对象键判断，
+      // 多传一个 taskReferences: [] 会改变它们看到的对象（真实 Role 的输出不受影响）。
+      const ctx = {
         situation: parts.situation,
         memory: parts.memory,
         recent: parts.recent,
-        platform: input.platform || '',
-      });
+      };
+      if (parts.taskReferences && parts.taskReferences.length) ctx.taskReferences = parts.taskReferences;
+      ctx.platform = input.platform || '';
+      const sys = this.role.build(ctx);
       const messages = [{ role: 'system', content: sys }];
       for (const h of history.slice(-20)) {
         messages.push({ role: h.isSelf ? 'assistant' : 'user', content: String(h.text || '') });
@@ -143,7 +159,8 @@ export class Brain {
       return { model: this.model, messages, temperature: 1.1, stream: false };
     };
 
-    const parts = { situation, memory: memLine, recent };
+    // taskReferences 也是可减块，但排在 recent → memory → situation 之后（最后才脱落）
+    const parts = { situation, memory: memLine, recent, taskReferences };
     const measure = (candidate) => JSON.stringify(payload(candidate)).length;
     // 视图报出的轮次可能超出本次请求范围，诊断里也只报范围内的轮数
     const roundsAvailable = recentView ? Math.min(recentView.roundCount, RECENT_TURN_LIMIT) : 0;
@@ -153,7 +170,9 @@ export class Brain {
     let topicsDropped = 0;
     if (body.length > this.maxInputChars) {
       // ① 先按最近对话的记录顺序，从最旧开始移除完整轮次（按真实序列化 payload 量，能放下即停）；
-      // ② 放弃最近对话后，仍超预算则按整条裁剪旧话题。最后沿用整块丢弃。
+      // ② 放弃最近对话后，仍超预算则按整条裁剪旧话题；
+      // ③ 沿用整块丢弃 recent → memory → situation；
+      // ④ 以上都放不下时，最后才脱落明确注入的 L6 任务引用。仍超限则维持拒发。
       const byRound = this.#dropOldestRounds(parts, recentView, measure);
       roundsDropped = byRound.dropped;
       let trimmed = byRound.parts;
@@ -162,7 +181,22 @@ export class Brain {
         trimmed = byTopic.parts;
         topicsDropped = byTopic.dropped;
       }
-      finalParts = planContextBudget({ measure, parts: trimmed, maxChars: this.maxInputChars }).parts;
+      // context-budget 的白名单仍只有三个参考块：任务引用在它之外单独作为最后一级淘汰。
+      const { taskReferences: keptReferences = taskReferences, ...budgetParts } = trimmed;
+      // 规划器必须用**同一份 L6 引用**量真实请求体：否则会低估规模，在应先丢 situation 时
+      // 错误保留 L5、删掉 L6。绑定引用后，规划结果与最终请求体用的是同一把尺子。
+      const measureWithReferences = (candidate) => measure({ ...candidate, taskReferences: keptReferences });
+      const planned = planContextBudget({
+        measure: measureWithReferences,
+        parts: budgetParts,
+        maxChars: this.maxInputChars,
+      }).parts;
+      finalParts = { ...planned, taskReferences: keptReferences };
+      // L6 是最后一级：只有 recent / memory / situation 三块全部淘汰后仍放不下，才脱落引用。
+      const allBlocksEvicted = !planned.situation && !planned.memory && !planned.recent;
+      if (allBlocksEvicted && measure(finalParts) > this.maxInputChars && finalParts.taskReferences.length) {
+        finalParts = { ...planned, taskReferences: [] };
+      }
       body = JSON.stringify(payload(finalParts));
     }
     // 诊断在 fetch 之前发出：超限时也先留一条记录，再照旧抛错。
