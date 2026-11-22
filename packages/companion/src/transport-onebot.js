@@ -37,6 +37,17 @@ function findReply(segs) {
   return null;
 }
 
+/**
+ * 把一帧数据转成文本，解析不了就返回 null（调用方直接丢弃）。
+ * 兼容 ws 的 Buffer/string，以及原生 MessageEvent.data 的字符串与二进制。
+ */
+function frameToText(data) {
+  if (typeof data === 'string') return data;
+  if (data instanceof ArrayBuffer) return new TextDecoder().decode(data);
+  if (ArrayBuffer.isView(data)) return new TextDecoder().decode(data);
+  return null;
+}
+
 /** message_id 是否可用于确认：非空非零字符串，或非零安全整数 */
 function usableMessageId(value) {
   if (typeof value === 'string') {
@@ -95,22 +106,61 @@ export class OneBot {
   }
 
   async #connect() {
+    // 优先用 ws（可带 headers 鉴权）；本地没装或解析失败时退回全局 WebSocket。
     const { WebSocket } = await import('ws').catch(() => ({ WebSocket: globalThis.WebSocket }));
     const sock = new WebSocket(this.wsUrl, { headers: this.#headers() });
     this.ws = sock;
 
-    sock.on?.('open', () => { this.connected = true; console.log('[onebot] 已连接 ' + this.wsUrl); });
-    sock.on?.('close', () => {
+    // 连接身份：第一个 close 之后这条连接就失效（live=false），
+    // 之后同一 socket 上的迟到 open/close/message/error 一律忽略——不改
+    // this.connected、不再排重连、不推进业务。等待重连期间以及新连接建立之后
+    // 都成立；this.ws 保持现有形状（失效连接不清空），靠 live 与 this.ws 双重判定。
+    let live = true;
+    const current = () => live && this.ws === sock;
+
+    const onOpen = () => {
+      if (!current()) return;
+      this.connected = true;
+      console.log('[onebot] 已连接 ' + this.wsUrl);
+    };
+    const onClose = () => {
+      if (!current()) return;
+      live = false;
       this.connected = false;
       console.log('[onebot] 断开，5 秒后重连');
-      setTimeout(() => this.#connect(), 5000);
-    });
-    sock.on?.('error', (e) => console.log('[onebot] 出错 ' + (e?.message || e)));
-    sock.on?.('message', (data) => {
+      // 只有「这条连接仍是当前连接」时才重连：已经换了新连接就不再补一条。
+      setTimeout(() => { if (this.ws === sock) this.#connect(); }, 5000);
+    };
+    const onError = (e) => {
+      if (!current()) return;
+      console.log('[onebot] 出错 ' + (e?.message || e?.type || e));
+    };
+    const onFrame = (data) => {
+      if (!current()) return;
+      const text = frameToText(data);
+      if (text === null) return;
       let ev;
-      try { ev = JSON.parse(String(data)); } catch { return; }
+      try { ev = JSON.parse(text); } catch { return; }
       this.#handle(ev);
-    });
+    };
+
+    if (typeof sock.on === 'function') {
+      // ws 的 EventEmitter：数据是 Buffer 或 string。
+      sock.on('open', onOpen);
+      sock.on('close', onClose);
+      sock.on('error', onError);
+      sock.on('message', onFrame);
+      return;
+    }
+
+    // 原生 EventTarget（如 Node 内置 WebSocket）：只有 addEventListener，
+    // 消息在 MessageEvent.data 上，二进制按 arraybuffer 交付。
+    if (typeof sock.addEventListener !== 'function') return;
+    if ('binaryType' in sock) sock.binaryType = 'arraybuffer';
+    sock.addEventListener('open', onOpen);
+    sock.addEventListener('close', onClose);
+    sock.addEventListener('error', onError);
+    sock.addEventListener('message', (e) => onFrame(e?.data));
   }
 
   #handle(ev) {
