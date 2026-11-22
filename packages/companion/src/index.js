@@ -48,6 +48,39 @@ import {
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
+/**
+ * 分层提示词预算的硬上限：与 Brain 默认的 maxInputChars 同一条契约（24000）。
+ * 这里只做入口校验，不重复预算算法；实际预算仍由 Brain / layer-quota 执行。
+ * 改 Brain 默认上限时，必须同步这里与 `cli-prompt-budget.test.mjs` 的漂移守卫。
+ */
+export const MAX_SYSTEM_BUDGET_CHARS = 24000;
+
+/** 固定失败文案：不含配置值、路径、异常原文。 */
+export const SYSTEM_BUDGET_CONFIG_ERROR = '配置不可用：memory.systemBudgetChars 必须是正安全整数且不超过硬上限；已停止（未读角色卡、未创建 Memory、未连接 OneBot、未调用模型）。';
+
+/** 配置闸门的固定原因码。 */
+export const SYSTEM_BUDGET_CODES = Object.freeze({
+  INVALID: 'system-budget-invalid',
+});
+
+/**
+ * 校验 `memory.systemBudgetChars`。
+ *
+ * - 省略（undefined）→ `{ok:true, value:null}`：完全沿用旧模型请求与日志；
+ * - 提供 → 必须是正安全整数且不超过硬上限，否则返回固定原因码；
+ * - 不在这里构造 Brain/Role，也不读取任何运行时资源。
+ *
+ * @param {unknown} value
+ * @returns {{ok:true, value:number|null} | {ok:false, code:string}}
+ */
+export function validateSystemBudgetChars(value) {
+  if (value === undefined) return { ok: true, value: null };
+  if (typeof value !== 'number' || !Number.isSafeInteger(value) || value <= 0 || value > MAX_SYSTEM_BUDGET_CHARS) {
+    return { ok: false, code: SYSTEM_BUDGET_CODES.INVALID };
+  }
+  return { ok: true, value };
+}
+
 // ── 配置 ──────────────────────────────────────────────────────
 export function loadConfig(explicitPath, argv = process.argv) {
   const file = explicitPath || path.join(__dirname, '..', 'config.json');
@@ -70,6 +103,7 @@ export function loadConfig(explicitPath, argv = process.argv) {
 export function normalizeConfig(cfg, file, argv = process.argv) {
   const dir = path.dirname(path.resolve(file));
   const rel = (p, def) => (p ? path.resolve(dir, p) : path.join(dir, def));
+  const systemBudgetChars = cfg.memory?.systemBudgetChars;
 
   return {
     apiKey: cfg.apiKey || process.env.DEEPSEEK_API_KEY || '',
@@ -121,6 +155,8 @@ export function normalizeConfig(cfg, file, argv = process.argv) {
     // 不迁移 v1、不发网络请求、不写真实记忆）
     memory: {
       retrieval: normalizeRetrievalConfig(cfg.memory?.retrieval),
+      // 原样保留输入，交给 main 在构造任何下游之前校验（省略则保持对象形状不变）。
+      ...(systemBudgetChars === undefined ? {} : { systemBudgetChars }),
     },
     reminders: argv.includes('--reminders'),
     dryRun: argv.includes('--dry-run'),
@@ -147,6 +183,19 @@ export function reportError(error, label) {
     ? '（' + error.code + '）'
     : '';
   console.error('[出错] ' + text + code);
+}
+
+// ── 提示词预算诊断 ────────────────────────────────────────────
+/**
+ * 把 Brain 已脱敏的 memory-budget 事件写到 CLI 日志。
+ *
+ * 事件字段由 Brain 固定为块名 / 计数 / 预算值（启用分层预算时 version=2，
+ * 含 quotas）；这里不再拼接账号、上下文、URL、路径或异常原文。
+ *
+ * @param {object} event
+ */
+export function logMemoryBudget(event) {
+  console.log('[memory-budget] ' + JSON.stringify(event));
 }
 
 // ── 私聊装配 ──────────────────────────────────────────────────
@@ -319,6 +368,22 @@ export async function main({ createBot, proc: injectedProc, process: injectedPro
     cfg = loadConfig(configPath, argv);
   }
 
+  // 提示词预算闸门：宽松路径与 --owner-private 都走同一份校验，且在角色卡 /
+  // Memory / OneBot / 模型之前失败。非法值只报固定文案，不复述输入。
+  const budget = validateSystemBudgetChars(cfg.memory?.systemBudgetChars);
+  if (!budget.ok) {
+    console.error('[配置] ' + SYSTEM_BUDGET_CONFIG_ERROR);
+    return {
+      ok: false,
+      bot: null,
+      reminders: null,
+      presence: null,
+      ownerPrivate,
+      systemBudget: { enabled: false, ok: false, code: budget.code },
+    };
+  }
+  const systemBudgetChars = budget.value;
+
   // 入口准入器在装配任何下游之前就绪；没有 flag 时为 null，旧行为不变。
   const ownerGate = ownerPrivate ? createOwnerPrivateGate({ ownerIds: cfg.ownerIds }) : null;
 
@@ -334,11 +399,19 @@ export async function main({ createBot, proc: injectedProc, process: injectedPro
   console.log('  记忆检索  ' + (cfg.memory.retrieval.enabled
     ? cfg.memory.retrieval.mode + '（上限 ' + cfg.memory.retrieval.maxChars + ' 字）'
     : '关'));
+  // 只有显式配置才多这一行；省略时启动横幅与旧版逐字节一致。
+  if (systemBudgetChars !== null) {
+    console.log('  提示词预算  ' + systemBudgetChars + ' 字（分层；硬上限 ' + MAX_SYSTEM_BUDGET_CHARS + '）');
+  }
   if (ownerGate) console.log('  准入      owner-private（仅白名单私聊）');
   console.log('');
 
   const memory = new Memory({ dir: cfg.dataDir });
-  const role = new Role({ cardPath: cfg.roleCard, maxChars: cfg.roleMaxChars });
+  const role = new Role({
+    cardPath: cfg.roleCard,
+    maxChars: cfg.roleMaxChars,
+    layered: systemBudgetChars !== null,
+  });
 
   // 角色卡体检
   const lint = role.lint();
@@ -357,6 +430,9 @@ export async function main({ createBot, proc: injectedProc, process: injectedPro
     role,
     memory,
     memoryBlocks: buildMemoryBlocks(cfg, memory),
+    // 省略（null）时两个选项都是旧默认：不启用分层预算，也不接诊断回调。
+    systemBudgetChars,
+    onMemoryBudget: systemBudgetChars === null ? null : logMemoryBudget,
   });
   const human = new Humanizer(cfg.humanize);
   const waker = new Waker({
@@ -481,7 +557,14 @@ export async function main({ createBot, proc: injectedProc, process: injectedPro
   });
 
   console.log('在跑了。Ctrl+C 退出。\n');
-  return { ok: true, bot, reminders, presence: presenceHost, ownerPrivate };
+  return {
+    ok: true,
+    bot,
+    reminders,
+    presence: presenceHost,
+    ownerPrivate,
+    systemBudget: { enabled: systemBudgetChars !== null, chars: systemBudgetChars },
+  };
 }
 
 /**

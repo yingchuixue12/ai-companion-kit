@@ -53,6 +53,7 @@
   "dataDir": "data",
   "// 7.1": "=== 记忆检索（默认关；打开只影响提示词里的记忆块，不迁移、不写盘、不联网）===",
   "memory": {
+    "// systemBudgetChars": "可选：省略 = 旧行为；显式填 1~24000 的正安全整数才启用分层提示词预算",
     "retrieval": {
       "enabled": false,
       "mode": "tail-window",

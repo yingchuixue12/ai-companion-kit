@@ -281,6 +281,31 @@ const brain = new Brain({
 `Brain` 只认 `memoryBlocks` 这个不透明钩子：它自己不读账本、不做过滤，
 检索、隐私与预算全在提供者那一侧。`memoryBlocks` 缺省为 `null`。
 
+### 提示词预算（默认关，显式开启）
+
+默认不设提示词预算：`Role` 保持旧版拼接顺序，`Brain` 的请求体与日志和以前逐字节一致。
+想按 system prompt 的目标长度分层裁剪时，在 `config.json` 里显式加：
+
+```json
+"memory": {
+  "systemBudgetChars": 8000
+}
+```
+
+- 值必须是**正安全整数，且不超过 24000**（与 `Brain` 的请求体硬上限同一条契约）；
+- **省略 = 旧行为**；显式提供才启用 `Role({ layered: true })` 与
+  `Brain({ systemBudgetChars })`，硬上限仍由 `Brain` 的 24000 字符请求预算兜底；
+- 分层模式把稳定人格层（基本规矩 / extra / 角色卡）放在最前，预算只削减
+  recent → memory → situation → 任务引用，**绝不裁稳定人格层**；
+- 每次模型请求前，CLI 会打印一条已有的脱敏 `memory-budget` 诊断（version 2）：
+  只有块名、字符数、轮次/话题计数和配额，不含账号、对话正文、URL 或本地路径；
+- 非法值（0 / 负数 / 小数 / 字符串 / null / 超过硬上限）在**读角色卡、创建 Memory、
+  连接 OneBot、调用模型之前**失败，CLI 非零退出，只打印固定错误、不回显输入值；
+  `--owner-private` 与宽松配置走同一份检查。
+
+> 边界：这条 CLI 接线目前只有**合成 OneBot + fake fetch 的离线证据**，
+> 尚未在真实芙兰宿主或真实 QQ 上验收。
+
 ### Waker · 潜水是怎么实现的
 
 - `setConfig(key, {...})` 给每个会话单独配规则
