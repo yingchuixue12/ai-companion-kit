@@ -32,6 +32,7 @@ import { Waker } from './wake.js';
 import { ConversationWindow } from './conversation-window.js';
 import { OneBot } from './transport-onebot.js';
 import { createPrivateTurnReplay } from './private-turn-replay.js';
+import { detectRepairIntent } from './reply-alignment.js';
 import { createReminderRuntime } from './reminder-runtime.js';
 import { createReminderCommands } from './reminder-commands.js';
 import { createPresenceQQHost } from './presence-qq-runtime.js';
@@ -344,6 +345,60 @@ export function pushPrivateMessage(window, msg) {
   return window.push(msg.key, msg, options);
 }
 
+// ── 修复轮的原对话上下文 ─────────────────────────────────────
+/**
+ * 修复轮的固定指令：只做当场修正，不反问、不猜、不讲自己的节奏。
+ * 普通轮次不拼接这段文字。
+ */
+export const REPAIR_DIRECTIVE = ' 对方刚指出你接错了话或读了旧消息：先用一句话承认接岔，然后只复述本轮最新消息里真正出现过的内容，必要时问一句确认，说完就停；不要猜对方"想说"什么，不要反问对方是哪句读错了，也不要解释自己的节奏。';
+
+/** 修复轮最多带多少条已落盘记录、多少条历史消息（用户 / 助理各算一条）。 */
+export const REPAIR_HISTORY_LIMITS = Object.freeze({ maxRows: 6, maxMessages: 12 });
+
+/**
+ * 只从已落盘账本里取**当前私聊会话**的原对话，按发生顺序还原成 Brain 的 history：
+ * 用户先、助理后，`isSelf` 标记与 Brain.reply 的 role 映射一致。
+ *
+ * - 只读：只调用 Memory.recentTurns()，不写账本、不迁移数据；
+ * - 不混会话：只保留 `where === key` 的记录，其他人的私聊 / 群聊一律丢弃；
+ * - 有界：先截最近 6 条记录，再按消息条数截到 12 条，避免修复轮把上下文撑大；
+ * - 当前批次尚未 commit（deferred），因此不会出现在 history 里，仍只通过 text 传入。
+ *
+ * @param {{recentTurns?: (n?:number)=>any[]}} memory
+ * @param {string} key 当前会话标识（如 'private:10001'）
+ * @returns {Array<{isSelf:boolean,text:string}>}
+ */
+export function buildRepairHistory(memory, key, { maxRows = REPAIR_HISTORY_LIMITS.maxRows, maxMessages = REPAIR_HISTORY_LIMITS.maxMessages } = {}) {
+  if (!memory || typeof memory.recentTurns !== 'function') return [];
+  const conversation = String(key ?? '');
+  if (!conversation) return [];
+
+  let rows;
+  try {
+    // 现有 Memory.recentTurns 只支持 excludeWhere，不能按 where 精确取；
+    // 这里沿用只读账本的公开入口取全部记录，再按当前会话过滤（dump 也是同样读法）。
+    rows = memory.recentTurns(Number.MAX_SAFE_INTEGER);
+  } catch {
+    return [];
+  }
+  if (!Array.isArray(rows)) return [];
+
+  const history = [];
+  const scoped = rows.filter((row) => row && typeof row === 'object'
+    && String(row.where ?? '') === conversation);
+  const rowLimit = Number.isSafeInteger(maxRows) && maxRows > 0 ? maxRows : REPAIR_HISTORY_LIMITS.maxRows;
+  for (const row of scoped.slice(-rowLimit)) {
+    const userText = String(row.text ?? '').trim();
+    if (userText) history.push({ isSelf: false, text: userText });
+    const assistantText = String(row.reply ?? '').trim();
+    if (assistantText) history.push({ isSelf: true, text: assistantText });
+  }
+  const messageLimit = Number.isSafeInteger(maxMessages) && maxMessages > 0
+    ? maxMessages
+    : REPAIR_HISTORY_LIMITS.maxMessages;
+  return history.slice(-messageLimit);
+}
+
 // ── 主程序 ────────────────────────────────────────────────────
 export async function main({ createBot, proc: injectedProc, process: injectedProcess } = {}) {
   // 默认维持当前运行方式；离线验证时只替换 bot 构造与进程对象。
@@ -600,14 +655,29 @@ export async function handleTurn({ bot, brain, human, memory, waker }, items, cf
   const key = last.key;
   const text = Waker.joinBatch(items);
 
-  const situation = last.isGroup
+  // 只有私聊的**当前批次最后一条**明确在说"你接错了"时，才进入修复路径；
+  // 群聊 / 普通私聊完全不调用 detectRepairIntent，保持原行为。
+  const repairMode = !last.isGroup && detectRepairIntent(last.text);
+
+  const baseSituation = last.isGroup
     ? '你在一个 QQ 群里。下面是群里刚连着说的几句话，最后一条是最新的。'
     : '你在跟 ' + last.name + ' 私聊。';
+  const situation = baseSituation + (repairMode ? REPAIR_DIRECTIVE : '');
+  // 修复轮额外带上同一会话已落盘的原对话（只读、有界）；当前批次仍只通过 text 传入。
+  const history = repairMode ? buildRepairHistory(memory, key) : [];
 
   // deferred：这一轮先不写记忆，等真的发出去了（Humanizer 完成且 sent > 0）再一次性提交
   let result;
   try {
-    result = await brain.reply({ key, userId: last.userId, userName: last.name, text, situation, record: 'deferred' });
+    result = await brain.reply({
+      key,
+      userId: last.userId,
+      userName: last.name,
+      text,
+      situation,
+      ...(repairMode ? { history } : {}),
+      record: 'deferred',
+    });
   } catch (error) {
     // 只包住生成阶段：原始异常原样重抛，现有 onError 语义不变。
     onGenerationError?.();
