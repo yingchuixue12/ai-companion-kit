@@ -329,6 +329,78 @@ diary.add(row);
 
 ---
 
+## 语音运行入口（可编程宿主 · 默认关闭）
+
+语音**不是**开箱能力：默认 `enabled=false`，不装供应商、不发网络、不接 CLI/QQ。
+宿主自己决定要不要开，并把 ASR/TTS 适配器注入进来；不要就继续纯文字。
+
+```js
+import { createVoiceRuntime, VOICE_DECISION } from 'ai-companion';
+
+const voice = createVoiceRuntime({
+  enabled: true,          // 必须显式 true；写 "true" / 1 会直接抛 TypeError
+  asr,                    // { transcribe(audio, { signal, timeoutMs }) }
+  tts,                    // { synthesize(request, { signal, timeoutMs }) }
+  memory: {               // 可选：长期记忆端口，签名是 remember({ text, confidence, ... })
+    async remember({ text }) { /* 宿主自己决定怎么存 */ },
+  },
+});
+
+// 收到一段语音
+const heard = await voice.ingest({ input: { kind: 'audio', mime: 'audio/ogg', size: 4096, ref: 'incoming://1' } });
+switch (heard.decision) {
+  case VOICE_DECISION.CHAT:    reply(heard.chat.text); break;                    // 置信度够，直接进聊天
+  case VOICE_DECISION.CONFIRM: askUser(`你是说「${heard.transcript.text}」吗？`, {
+    yes: () => voice.confirm(heard.pending.id),
+    no: () => voice.reject(heard.pending.id),                                    // 回退打字
+  }); break;
+  case VOICE_DECISION.REPEAT:  askUser('没听清，再说一遍？'); break;
+  default:                     askUser('还是打字吧'); break;                     // 校验失败 / 适配器缺失
+}
+
+// 把回复准备好（只准备，不发送——本入口不碰任何平台）
+const said = await voice.speak({ text: '在呢，咋了' });
+await send(said.prepared === 'voice' ? { audio: said.audioRef } : { text: said.fallbackText });
+if (said.audioRef) voice.release(said.audioRef);                                 // 发完释放临时音频
+
+await voice.dispose();                                                           // 退出时清干净
+```
+
+行为契约（每条都有离线用例）：
+
+| 场景 | 行为 |
+|---|---|
+| ASR 置信度低于 `minConfidence`（默认 0.6） | 不写长期记忆、不进聊天；挂成待确认，只有 `confirm(id)` 能放行，`reject(id)` 回退文字 |
+| 入参自带 `confirmed: true` | **不采纳**：确认只能走 `confirm(id)`，没有可绕过的前置确认 |
+| TTS 失败 / 超时 / 适配器缺失 / 存储失败 | `prepared: 'text'`，`fallbackText` 一定有值，`audioRef` 与 `artifact` 都是 `null` |
+| 入口关闭（默认）、或 `dispose()` 已开始 | 两个方向都只退文字；不建临时目录、不调用适配器、`code: voice-closed` |
+
+`speak()` 的 `prepared` 只是「准备好了语音」或「只能给文字」，**不代表已投递**——
+发送永远是宿主的事，本入口不发消息、不开 CLI/QQ。
+
+关闭契约（`dispose()` 是 async 的）：
+
+- 一被调用就同步拒绝新操作（`voice-closed`），然后**等在途操作归零**再清理；
+- 在途的转写/合成察觉到关闭后：不新增待确认、不写记忆、刚生成的音频当场删掉（删不掉时 `audioCleanupFailed: true`），
+  所以关闭完成后不会再有文件或记忆冒出来；
+- 自建 store 的临时目录一并删除；注入 store 只删自己的 ref。
+
+临时文件归属（不混账）：
+
+- **输入音频**是转写期文件：转写结束（成功或失败）就被删掉；本入口不提供"保留用户语音"的开关。
+- **合成音频**是投递期文件：`speak()` 返回的 `audioRef` 归宿主发送用，发完调 `release(ref)`。
+  只有真删掉或确认已不存在才停止追踪；存储报错会保留追踪（`kept: true`），留给 `dispose()` 重试并如实报告。
+- `purgeExpired()` 只清**本入口自己创建**的过期条目；注入共享 store 时绝不调用 `store.purgeExpired()`，
+  不会删到宿主的文件。
+- 待确认条目只在内存里，`confirmTtlMs`（默认 5 分钟）到期作废，`maxPending`（默认 8）满了就回退文字——不会攒着用户语音。
+
+`voice.status()` 是只读自述：启用/关闭状态、在途数、适配器能力（含 `offline` 标记）、临时存储归属与追踪数、待确认条数、策略值。
+
+**边界**：这里只有供应商中立契约 + 离线桩（D0）。真实 ASR/TTS 供应商、费用、隐私留存（U1）未确认前不接入；
+本入口不改 `node src/index.js` 主 CLI，也不该被当成"已经能语音聊天"。
+
+---
+
 ## 角色卡怎么写
 
 见 `role.example.md`。要点就三条：

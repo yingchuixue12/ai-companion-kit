@@ -29,6 +29,9 @@
  *   // 只想要"该不该说话"
  *   const waker = new Waker();
  *   waker.shouldWake({ key: 'group:1', userId: '9', text: '@小鱼 在吗', isAtMe: true });
+ *
+ *   // 想让宿主自己决定开语音（默认关；关闭时只退文字）
+ *   const voice = createVoiceRuntime({ enabled: false });   // 打开要 enabled:true + 注入 asr/tts
  */
 export { Memory } from './memory.js';
 export { Role } from './role.js';
@@ -38,3 +41,9 @@ export { Waker } from './wake.js';
 export { Diary } from './diary.js';
 export { OneBot, segsToText } from './transport-onebot.js';
 export { loadConfig, handleTurn } from './index.js';
+export {
+  createVoiceRuntime,
+  VOICE_RUNTIME_VERSION,
+  VOICE_DECISION,
+  VOICE_RUNTIME_ERROR,
+} from './media/voice-runtime.js';
