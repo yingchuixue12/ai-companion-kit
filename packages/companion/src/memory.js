@@ -40,6 +40,23 @@ function renderRecentRows(rows) {
     + '\n（这些是真说过的，别装作不知道，也别生硬复述）\n';
 }
 
+/** kind → people.<id> 里的数组字段（pending 不按复数命名）。未知 kind 直接拒绝。 */
+const MEMORY_FIELDS = Object.freeze({ trait: 'traits', fact: 'facts', topic: 'topics', pending: 'pending' });
+
+function memoryField(kind) {
+  const field = MEMORY_FIELDS[String(kind)];
+  if (!field) throw new TypeError('未知的记忆类目：' + String(kind));
+  return field;
+}
+
+/**
+ * 记忆条目的归一化：与 `remember`/`put` 完全一致（空白折叠 + 截断 160）。
+ * 只有同一套归一化，「删掉刚才记住的那条」才可能精确命中。
+ */
+function normalizeEntry(value) {
+  return String(value || '').replace(/\s+/g, ' ').trim().slice(0, 160);
+}
+
 export class Memory {
   /**
    * @param {object} opts
@@ -118,6 +135,69 @@ export class Memory {
     p.interactions = (Number(p.interactions) || 0) + 1;
     this.#writeAll(all);
     return p;
+  }
+
+  // ── 纠正：删除 / 替换 ────────────────────────────────────────
+  /**
+   * 删掉某人账本里与 text **完全一致**（空白折叠后）的条目。
+   *
+   * - 只动这一个人、这一个类目的数组：其它人、其它类目、别的条目都不受影响；
+   * - 目标不存在时返回 0，且不建人、不写盘：重复删除是幂等的，不会顺手记一笔互动；
+   * - 空目标直接抛 TypeError，避免把「删掉一切」当成一次合法纠正。
+   *
+   * @param {string|number} id
+   * @param {{kind: 'trait'|'fact'|'topic'|'pending', text: string}} opts
+   * @returns {number} 实际删除的条数
+   */
+  forget(id, { kind, text } = {}) {
+    const field = memoryField(kind);
+    const target = normalizeEntry(text);
+    if (!target) throw new TypeError('forget 需要非空的 text');
+    const all = this.#readAll();
+    const p = all[String(id)];
+    if (!p || !Array.isArray(p[field])) return 0;
+    const kept = p[field].filter((entry) => entry !== target);
+    const removed = p[field].length - kept.length;
+    if (!removed) return 0;
+    p[field] = kept;
+    this.#writeAll(all);
+    return removed;
+  }
+
+  /**
+   * 把某人账本里的某一条原地改成 to（纠正）。
+   *
+   * - 只有 from 真的存在才写盘；不存在返回 0，不建人、不新增条目；
+   * - 位置保持原样（不是挪到最新），因此「纠正」不会改变提示词里的先后顺序；
+   * - 如果 to 已经在同一类目里，旧条目被删除而不是产生两条一样的记忆；
+   * - from 与 to 归一化后相同视为无变化，返回 0。
+   *
+   * @param {string|number} id
+   * @param {{kind: 'trait'|'fact'|'topic'|'pending', from: string, to: string}} opts
+   * @returns {number} 实际替换的条数（0 或 1）
+   */
+  replace(id, { kind, from, to } = {}) {
+    const field = memoryField(kind);
+    const source = normalizeEntry(from);
+    const target = normalizeEntry(to);
+    if (!source) throw new TypeError('replace 需要非空的 from');
+    if (!target) throw new TypeError('replace 需要非空的 to');
+    if (source === target) return 0;
+    const all = this.#readAll();
+    const p = all[String(id)];
+    if (!p || !Array.isArray(p[field])) return 0;
+    if (!p[field].includes(source)) return 0;
+    const next = [];
+    for (const entry of p[field]) {
+      if (entry === source) {
+        if (!next.includes(target)) next.push(target);
+      } else if (entry !== target) {
+        next.push(entry);
+      }
+    }
+    p[field] = next;
+    this.#writeAll(all);
+    return 1;
   }
 
   /** 记一次互动（不加内容，只涨计数） */
