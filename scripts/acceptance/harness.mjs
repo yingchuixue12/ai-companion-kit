@@ -12,8 +12,11 @@
  * ── 明确不做什么（避免把框架当成真实验收）─────────────────────
  *   - 不发真实 QQ / OneBot / HTTP：默认 fetchImpl 直接拒绝，且**不改全局 fetch**
  *     （`globalThis.fetch` 从头到尾不动，避免制造进程级网络绕过）。
- *   - 不读写仓库 `data/`、真实配置、私密记忆或日志：tempDir 必须是系统临时目录，
+ *   - 不读写仓库 `data/`、真实配置、私密记忆或日志：临时区必须落在系统临时目录下，
  *     指到仓库里直接拒绝（code `unsafe-temp-dir`）。
+ *   - 临时目录所有权：harness 永远自己在调用者给的（经验证的专用）父目录下 mkdtemp
+ *     一个自己的目录，cleanup 也只删这一个。系统临时根本身、仓库、越界实路径
+ *     （软链接 / 联接点指出去）都拒绝；调用者父目录里的东西一概不碰。
  *   - 不调用真实模型：本 checkout 的 `brain.js` 直接调用全局 `fetch`，没有注入点，
  *     所以模型侧一律用脚本化替身；相关 step 的 `model.transport` 记
  *     `synthetic-scripted`，报告里同时给 `model-transport-synthetic` 诊断码。
@@ -72,6 +75,31 @@ export function projectError(error) {
   return detail === null ? { code } : { code, detail };
 }
 
+/** 当前平台的文件系统是否大小写不敏感（只影响路径比较，不影响 I/O）。 */
+const CASE_INSENSITIVE_FS = process.platform === 'win32';
+
+/**
+ * 路径比较用的归一化：绝对化 + （Windows）小写。
+ * 只做词法归一，不碰文件系统；软链接 / 联接点的解析见 resolveRealPath。
+ * @param {string} value
+ * @param {boolean} caseInsensitive
+ */
+function normalizeForCompare(value, caseInsensitive) {
+  const text = path.resolve(String(value));
+  return caseInsensitive ? text.toLowerCase() : text;
+}
+
+/**
+ * 归一化后的包含判断：相等或真在下一层。
+ * 父目录本身以分隔符结尾（盘根 `C:\`、UNC 共享根 `\\host\share\`）时不再补第二个，
+ * 否则共享根会被判成"谁都不在它下面"。
+ */
+function isInsideNormalized(parent, candidate) {
+  if (candidate === parent) return true;
+  const prefix = parent.endsWith(path.sep) ? parent : parent + path.sep;
+  return candidate.startsWith(prefix);
+}
+
 /**
  * 路径包含判断（平台感知）。
  * Windows 文件系统大小写不敏感：先统一小写再比，否则 `c:/users/...` 会被误判成
@@ -80,29 +108,129 @@ export function projectError(error) {
  * @param {string} candidate 候选路径
  */
 export function isPathInside(parent, candidate) {
-  const normalize = (value) => {
-    const text = path.resolve(String(value));
-    return process.platform === 'win32' ? text.toLowerCase() : text;
-  };
-  const root = normalize(parent);
-  const child = normalize(candidate);
-  return child === root || child.startsWith(root + path.sep);
+  return isInsideNormalized(
+    normalizeForCompare(parent, CASE_INSENSITIVE_FS),
+    normalizeForCompare(candidate, CASE_INSENSITIVE_FS),
+  );
 }
 
 /**
- * 校验临时目录安全：必须在系统临时目录下，且不能落在仓库里。
- * 这是「禁止读写 repo data/、真实配置」这条硬约束的执行点。
+ * 判定「候选专用父目录」是否可接受。**纯函数**：不做任何 I/O。
+ *
+ * 判定顺序（先严重后轻微，detail 是闭合码，会进诊断）：
+ *   1. `root-path`          文件系统根 / UNC 共享根——太浅，递归清理会波及整盘；
+ *   2. `inside-repo`        仓库里（含 data/）——绝不落盘到真实项目目录；
+ *   3. `not-dedicated-root` 系统临时根本身——它是操作系统和其他程序的，不属于本次运行；
+ *   4. `outside-os-tmp`     越出系统临时区。
+ *
+ * 同一套判定既用于调用者给的**写法**，也用于它的**实路径**（先词法、后 realpath），
+ * 所以软链接 / 联接点指到仓库或临时区外同样会被拒。
+ *
+ * @param {string} candidate 候选路径
+ * @param {object} [options]
+ * @param {string} [options.tmpRoot] 系统临时区根（默认 os.tmpdir()）
+ * @param {string} [options.repoRoot] 仓库根（默认 REPO_ROOT）
+ * @param {boolean} [options.caseInsensitive] 是否大小写不敏感（默认按平台）
+ * @returns {{ok: true, path: string} | {ok: false, detail: string}}
  */
-export function assertSafeTempRoot(dir) {
-  const resolved = path.resolve(String(dir));
-  const resolvedTmp = path.resolve(os.tmpdir());
-  if (isPathInside(REPO_ROOT, resolved)) {
-    throw acceptanceError('unsafe-temp-dir', 'inside-repo');
+export function classifyTempParent(candidate, options = {}) {
+  const {
+    tmpRoot = os.tmpdir(),
+    repoRoot = REPO_ROOT,
+    caseInsensitive = CASE_INSENSITIVE_FS,
+  } = options ?? {};
+
+  const normalize = (value) => normalizeForCompare(value, caseInsensitive);
+  const target = normalize(candidate);
+  const tmp = normalize(tmpRoot);
+  const repo = normalize(repoRoot);
+  const filesystemRoot = normalize(path.parse(path.resolve(String(candidate))).root);
+
+  if (target === filesystemRoot) return { ok: false, detail: 'root-path' };
+  if (isInsideNormalized(repo, target)) return { ok: false, detail: 'inside-repo' };
+  if (target === tmp) return { ok: false, detail: 'not-dedicated-root' };
+  if (!isInsideNormalized(tmp, target)) return { ok: false, detail: 'outside-os-tmp' };
+  return { ok: true, path: target };
+}
+
+/**
+ * 解析实路径，并把失败原因投影成闭合码（不转发任何系统错误文本）。
+ * 软链接 / 联接点 / 8.3 短名都按真实路径算；解析不了就 fail closed。
+ * @param {string} target
+ * @returns {{path: string} | {path: null, detail: string}}
+ */
+function resolveRealPath(target) {
+  try {
+    return { path: fs.realpathSync(target) };
+  } catch (error) {
+    const code = typeof error?.code === 'string' ? error.code : '';
+    // ENOENT = 路径不存在；其余（ENOTDIR / ELOOP / …）= 存在但解析不出真实目录。
+    return { path: null, detail: code === 'ENOENT' ? 'parent-missing' : 'unresolvable-real-path' };
   }
-  if (!isPathInside(resolvedTmp, resolved)) {
-    throw acceptanceError('unsafe-temp-dir', 'outside-os-tmp');
+}
+
+/** 系统临时区的实路径（临时根本身可能就是链接，例如 macOS 的 /tmp）。 */
+function realTmpRoot() {
+  const tmp = path.resolve(os.tmpdir());
+  return resolveRealPath(tmp).path ?? tmp;
+}
+
+/** 仓库根的实路径（用于实路径判定；解析不了就退回词法路径）。 */
+function realRepoRoot() {
+  return resolveRealPath(REPO_ROOT).path ?? REPO_ROOT;
+}
+
+/**
+ * 校验调用者给的**专用父目录**，返回解析后的绝对路径。
+ *
+ * 注意语义：这个路径只是「往哪儿放」的父目录，**不是**要清理的目标。
+ * harness 会在它下面自己 mkdtemp 一个目录，cleanup 只删那个目录。
+ *
+ * @param {string} dir
+ * @returns {string} 解析后的绝对路径（父目录本身）
+ */
+export function assertSafeTempParent(dir) {
+  if (typeof dir !== 'string' || dir.trim() === '') {
+    throw acceptanceError('unsafe-temp-dir', 'empty-path');
   }
+  const resolved = path.resolve(dir);
+
+  // ① 先按调用者给的写法判（纯词法）。
+  const lexical = classifyTempParent(resolved);
+  if (!lexical.ok) throw acceptanceError('unsafe-temp-dir', lexical.detail);
+
+  // ② 再按实路径判一次：软链接 / 联接点不得把"临时父目录"指到仓库或临时区外。
+  //    实路径也会让 ENOENT / ENOTDIR 这类"根本不能用"的写法 fail closed。
+  const real = resolveRealPath(resolved);
+  if (real.path === null) throw acceptanceError('unsafe-temp-dir', real.detail);
+  const realVerdict = classifyTempParent(real.path, { tmpRoot: realTmpRoot(), repoRoot: realRepoRoot() });
+  if (!realVerdict.ok) throw acceptanceError('unsafe-temp-dir', realVerdict.detail);
+
+  // ③ 父目录必须确实是目录：不为调用者在任意位置创建目录。
+  //    realpath 已经成功过，正常情况这里一定有 stat；拿不到（并发删除等）按"不是目录"
+  //    处理，同样是 fail closed，不把系统错误文本带出去。
+  const isDirectory = fs.statSync(real.path, { throwIfNoEntry: false })?.isDirectory() === true;
+  if (!isDirectory) throw acceptanceError('unsafe-temp-dir', 'parent-not-directory');
+
   return resolved;
+}
+
+/**
+ * 本 harness 是否有权递归删除这个目录。
+ *
+ * 只认自己的产物：目录名必须是本 harness 的 mkdtemp 前缀，且词法与实路径都要落在
+ * 系统临时区、不是临时根、不在仓库里。任何一条不成立就不删（fail closed）。
+ * @param {string} dir
+ * @returns {boolean}
+ */
+export function isOwnedHarnessTempRoot(dir) {
+  if (typeof dir !== 'string' || dir.trim() === '') return false;
+  const resolved = path.resolve(dir);
+  if (!path.basename(resolved).startsWith(TEMP_PREFIX)) return false;
+  if (!classifyTempParent(resolved).ok) return false;
+  const real = resolveRealPath(resolved);
+  if (real.path === null) return false;
+  return classifyTempParent(real.path, { tmpRoot: realTmpRoot(), repoRoot: realRepoRoot() }).ok;
 }
 
 /* ───────────────────────── 小工具 ───────────────────────── */
@@ -282,8 +410,9 @@ function normalizeDelivery(delivery) {
  * @param {number|(() => number)} [options.now] 虚拟时钟起点（数字）或外部时钟函数；
  *   给函数时 advanceClock 会拒绝（code `clock-not-virtual`）
  * @param {number} [options.seed] 随机源种子
- * @param {string} [options.tempDir] 指定临时目录（必须在系统临时目录下）；
- *   不给就自己 mkdtemp
+ * @param {string} [options.tempDir] 调用者提供的**专用父目录**（必须已存在、在系统临时
+ *   目录下、不在仓库里、实路径也不越界）；harness 会在它下面自己 mkdtemp 一个目录，
+ *   cleanup 只删那一个，父目录里的任何东西都不动。不给就在系统临时目录下自己 mkdtemp。
  * @param {Array|Function} [options.brainReplies] 脚本化假 brain 的回复序列
  * @param {string|string[]|Function} [options.sendBehavior] 假 bot 的发送回执行为
  * @param {(url: string, init?: object) => Promise<any>} [options.fetchImpl]
@@ -327,11 +456,14 @@ export function createHarness(options = {}) {
   };
 
   /* ── 目录 ── */
-  const ownsTempRoot = tempDir === undefined || tempDir === null;
-  const root = ownsTempRoot
-    ? fs.mkdtempSync(path.join(os.tmpdir(), TEMP_PREFIX))
-    : assertSafeTempRoot(tempDir);
-  fs.mkdirSync(root, { recursive: true });
+  // 所有权规则（见文件头）：无论有没有 tempDir，root 都由本 harness 自己 mkdtemp 出来，
+  // cleanup 也只删 root。tempDir 只是「经验证的专用父目录」，它本身永远不被清理。
+  const injectedParent = tempDir === undefined || tempDir === null
+    ? null
+    : assertSafeTempParent(tempDir);
+  const tempBase = injectedParent ?? path.resolve(os.tmpdir());
+  const root = fs.mkdtempSync(path.join(tempBase, TEMP_PREFIX));
+  const ownsTempRoot = true;
   let cleaned = false;
   const pathOf = (...segments) => path.join(root, ...segments.map(String));
   /**
@@ -428,11 +560,15 @@ export function createHarness(options = {}) {
     version: ACCEPTANCE_VERSION,
     seed,
     tempRoot: root,
+    // 本 harness 的临时区父目录（调用者给的专用父目录，或系统临时目录）。
+    // 仅用于报告/追溯：它不属于本 harness，cleanup 永远不删它。
+    tempParentRoot: tempBase,
+    tempRootSource: injectedParent === null ? 'os-tmpdir-mkdtemp' : 'caller-parent-mkdtemp',
     ownsTempRoot,
     injections: Object.freeze({
       now: clockSource === null ? 'virtual' : 'injected',
       seed,
-      tempDir: ownsTempRoot ? 'mkdtemp' : 'injected',
+      tempDir: injectedParent === null ? 'mkdtemp' : 'caller-parent-mkdtemp',
       brainReplies: typeof brainReplies === 'function' ? 'function' : brainReplies.length,
       sendBehavior: typeof sendBehavior === 'function' ? 'function' : sendBehavior,
       fetchImpl: injectedFetch === null ? 'deny' : 'injected',
@@ -577,12 +713,17 @@ export function createHarness(options = {}) {
       return harness.tempFiles().filter((relative) => roots.has(relative.split('/')[0]));
     },
     /**
-     * 清理临时目录。幂等：第二次调用什么都不做。
-     * 只删构造时校验过的那个目录（构造期已确认在系统临时目录下、不在仓库里）。
+     * 清理本 harness 自己 mkdtemp 出来的那个目录。幂等：第二次调用什么都不做。
+     *
+     * 删之前再复核一次身份（isOwnedHarnessTempRoot）：临时区、非系统临时根、
+     * 不在仓库、实路径也没越界。复核不通过就**一个字节都不删**并返回 false——
+     * 调用者给的父目录、系统临时根、仓库永远不在删除范围内。
+     * @returns {boolean} 是否真的删除了目录
      */
     cleanup() {
       if (cleaned) return false;
       cleaned = true;
+      if (!isOwnedHarnessTempRoot(root)) return false;
       fs.rmSync(root, { recursive: true, force: true });
       return true;
     },

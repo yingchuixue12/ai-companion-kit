@@ -4,7 +4,9 @@
  * 覆盖：
  *   1. 契约导出：ACCEPTANCE_VERSION、createHarness、runScenario、CLI 主流程；
  *   2. 确定性：同 seed 同输入 → 报告逐字节相同；虚拟时钟可推进、外部时钟拒绝推进；
- *   3. 隔离：每个 harness 一个临时目录、cleanup 幂等；拒绝把临时目录指进仓库；
+ *   3. 隔离：每个 harness 一个临时目录、cleanup 幂等；临时目录所有权——调用者给的
+ *      只能是「经验证的专用父目录」，只删 harness 自己 mkdtemp 出来的子目录；
+ *      系统临时根 / 仓库 / 越界实路径一律拒绝；
  *   4. 防护：默认 fetch 直接拒绝、全局 fetch 不被改动、checklist 源码里没有 I/O；
  *   5. 事实：每个 step 的 8 个槽位齐全、期望/实际差异可机读、非合成输入被拒；
  *   6. 计数与退出码：0=全通过、1=有失败、2=参数/框架错误，not-covered 不算通过；
@@ -38,8 +40,11 @@ import {
   ACCEPTANCE_VERSION,
   REPO_ROOT,
   acceptanceError,
+  assertSafeTempParent,
   captureConsole,
+  classifyTempParent,
   createHarness,
+  isOwnedHarnessTempRoot,
   projectError,
   runScenario,
 } from './harness.mjs';
@@ -189,6 +194,11 @@ test('隔离：每个 harness 一个临时目录，cleanup 幂等且互不影响
     assert.notEqual(left.tempRoot, right.tempRoot);
     assert.ok(fs.existsSync(left.tempRoot));
     assert.ok(fs.existsSync(right.tempRoot));
+    // 默认行为不变：自己 mkdtemp 在系统临时目录下，父目录就是系统临时目录。
+    assert.equal(left.tempRootSource, 'os-tmpdir-mkdtemp');
+    assert.equal(left.tempParentRoot, path.resolve(os.tmpdir()));
+    assert.equal(left.injections.tempDir, 'mkdtemp');
+    assert.equal(left.ownsTempRoot, true);
     left.writeFile('nested/note.txt', 'x');
     assert.ok(fs.existsSync(path.join(left.tempRoot, 'nested', 'note.txt')));
 
@@ -205,29 +215,199 @@ test('隔离：每个 harness 一个临时目录，cleanup 幂等且互不影响
   }
 });
 
-test('隔离：拒绝把临时目录指到仓库里 / 系统临时目录之外', () => {
+/** 系统临时目录下与验收前缀同形的条目数（用来证明"拒绝时什么都没建"）。 */
+function acceptanceEntriesInTmp() {
+  return fs.readdirSync(os.tmpdir()).filter((name) => name.startsWith('ai-companion-acceptance-')).length;
+}
+
+test('隔离：系统临时根本身 / 仓库 / 越界路径一律拒绝，且拒绝时一个目录都不建', () => {
+  const rejected = [
+    // 系统临时根本身（带不带尾分隔符都一样）：它属于操作系统和其他程序，不是专用目录。
+    [os.tmpdir(), 'not-dedicated-root'],
+    [os.tmpdir() + path.sep, 'not-dedicated-root'],
+    // 仓库与仓库数据目录：绝不落盘到真实项目目录。
+    [REPO_ROOT, 'inside-repo'],
+    [path.join(REPO_ROOT, 'data'), 'inside-repo'],
+    // 越出系统临时区：上级目录也不行。
+    [path.dirname(os.tmpdir()), 'outside-os-tmp'],
+  ];
+  if (process.platform === 'win32') {
+    // 盘根 / UNC 共享根：太浅，递归清理会波及整盘。
+    rejected.push([path.parse(os.tmpdir()).root, 'root-path']);
+  }
+
+  const before = acceptanceEntriesInTmp();
+  for (const [dir, detail] of rejected) {
+    assert.throws(
+      () => createHarness({ tempDir: dir }),
+      (error) => error.code === 'unsafe-temp-dir' && error.detail === detail,
+      '应拒绝 ' + dir + '（期望 detail ' + detail + '）',
+    );
+  }
+  // 专门的父目录必须已经存在：不为调用者在任意位置创建目录。
+  const missing = path.join(os.tmpdir(), 'acc-parent-missing-' + process.pid + '-' + Date.now());
   assert.throws(
-    () => createHarness({ tempDir: path.join(REPO_ROOT, 'data') }),
-    (error) => error.code === 'unsafe-temp-dir',
+    () => createHarness({ tempDir: missing }),
+    (error) => error.code === 'unsafe-temp-dir' && error.detail === 'parent-missing',
   );
+  assert.equal(fs.existsSync(missing), false, '拒绝时不该把父目录建出来');
+  // 空值 / 非目录同样拒绝（这里传的是已存在的临时文件）。
   assert.throws(
-    () => createHarness({ tempDir: REPO_ROOT }),
-    (error) => error.code === 'unsafe-temp-dir',
+    () => createHarness({ tempDir: '   ' }),
+    (error) => error.code === 'unsafe-temp-dir' && error.detail === 'empty-path',
   );
-  assert.throws(
-    () => createHarness({ tempDir: path.dirname(os.tmpdir()) }),
-    (error) => error.code === 'unsafe-temp-dir',
-  );
-  // 临时目录里的子路径是允许的。
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'acc-safe-'));
-  const harness = createHarness({ tempDir: dir });
+
+  // 已存在但是文件 → 不是目录；文件里再套路径 → 解析不出真实目录（各平台码值不同，
+  // 但都必须是闭合 detail，且都拒绝）。
+  const scratch = fs.mkdtempSync(path.join(os.tmpdir(), 'acc-notdir-'));
   try {
-    assert.equal(harness.tempRoot, path.resolve(dir));
-    assert.equal(harness.ownsTempRoot, false);
+    const plainFile = path.join(scratch, 'plain.txt');
+    fs.writeFileSync(plainFile, 'x', 'utf8');
+    assert.throws(
+      () => createHarness({ tempDir: plainFile }),
+      (error) => error.code === 'unsafe-temp-dir' && error.detail === 'parent-not-directory',
+    );
+    assert.throws(
+      () => createHarness({ tempDir: path.join(plainFile, 'sub') }),
+      (error) => error.code === 'unsafe-temp-dir'
+        && ['parent-missing', 'unresolvable-real-path'].includes(error.detail),
+    );
+  } finally {
+    fs.rmSync(scratch, { recursive: true, force: true });
+  }
+  assert.equal(acceptanceEntriesInTmp(), before, '拒绝路径时仍然建了临时目录');
+});
+
+test('隔离：调用者给的目录只当专用父目录——只删自己新建的子目录，调用者文件原样保留', () => {
+  const parent = fs.mkdtempSync(path.join(os.tmpdir(), 'acc-owner-'));
+  const marker = path.join(parent, 'caller-marker.txt');
+  const callerDir = path.join(parent, 'caller-dir');
+  fs.writeFileSync(marker, 'keep-me', 'utf8');
+  fs.mkdirSync(callerDir);
+  fs.writeFileSync(path.join(callerDir, 'keep.txt'), 'keep', 'utf8');
+
+  let harness;
+  try {
+    harness = createHarness({ tempDir: parent });
+    assert.equal(harness.tempParentRoot, path.resolve(parent));
+    assert.equal(harness.tempRootSource, 'caller-parent-mkdtemp');
+    assert.equal(harness.injections.tempDir, 'caller-parent-mkdtemp');
+    assert.equal(harness.ownsTempRoot, true);
+    // 根目录是父目录下的新建子目录，不是父目录本身。
+    assert.notEqual(harness.tempRoot, path.resolve(parent));
+    assert.equal(path.dirname(harness.tempRoot), path.resolve(parent));
+    assert.ok(fs.existsSync(harness.tempRoot));
+    assert.equal(path.basename(harness.tempRoot).startsWith('ai-companion-acceptance-'), true);
+
+    harness.writeFile('nested/note.txt', 'x');
+    assert.ok(fs.existsSync(path.join(harness.tempRoot, 'nested', 'note.txt')));
+
+    const root = harness.tempRoot;
+    assert.equal(harness.cleanup(), true);
+    // 只删自己新建的那个子目录…
+    assert.equal(fs.existsSync(root), false, 'harness 没删掉自己新建的目录');
+    // …调用者放在父目录里的东西一个都不能少。
+    assert.equal(fs.existsSync(parent), true, '调用者的父目录被删了');
+    assert.equal(fs.existsSync(marker), true, '调用者的标记文件被删了');
+    assert.equal(fs.readFileSync(marker, 'utf8'), 'keep-me');
+    assert.equal(fs.existsSync(path.join(callerDir, 'keep.txt')), true, '调用者的子目录被删了');
+    // 幂等：第二次不删、不报错，调用者的文件仍在。
+    assert.equal(harness.cleanup(), false);
+    assert.equal(harness.close(), false);
+    assert.equal(fs.existsSync(marker), true);
+  } finally {
+    harness?.cleanup();
+    fs.rmSync(parent, { recursive: true, force: true });
+  }
+});
+
+test('隔离：cleanup 守卫只认自己 mkdtemp 出来的目录', () => {
+  // 系统临时根、仓库、空串、相对路径都不是"自己的"。
+  assert.equal(isOwnedHarnessTempRoot(os.tmpdir()), false);
+  assert.equal(isOwnedHarnessTempRoot(REPO_ROOT), false);
+  assert.equal(isOwnedHarnessTempRoot(''), false);
+  assert.equal(isOwnedHarnessTempRoot('   '), false);
+  assert.equal(isOwnedHarnessTempRoot(path.join('some', 'relative-dir')), false);
+
+  const parent = fs.mkdtempSync(path.join(os.tmpdir(), 'acc-guard-'));
+  const unrelated = path.join(parent, 'not-owned');
+  fs.mkdirSync(unrelated);
+  const harness = createHarness({ tempDir: parent });
+  try {
+    // 前缀不符（调用者自己的目录）不删。
+    assert.equal(isOwnedHarnessTempRoot(unrelated), false);
+    // 自己新建的目录可以删。
+    assert.equal(isOwnedHarnessTempRoot(harness.tempRoot), true);
+
+    // 目录已经不在了：cleanup 不报错，也不再"删"一次。
+    const root = harness.tempRoot;
+    fs.rmSync(root, { recursive: true, force: true });
+    assert.equal(isOwnedHarnessTempRoot(root), false);
+    assert.equal(harness.cleanup(), false);
+    // 父目录与调用者目录仍在。
+    assert.equal(fs.existsSync(unrelated), true);
+    assert.equal(fs.existsSync(parent), true);
   } finally {
     harness.cleanup();
+    fs.rmSync(parent, { recursive: true, force: true });
   }
-  assert.equal(fs.existsSync(dir), false);
+});
+
+test('隔离：软链接 / 联接点不得把专用父目录指到仓库或系统临时根', () => {
+  const parent = fs.mkdtempSync(path.join(os.tmpdir(), 'acc-link-'));
+  const linkToRepo = path.join(parent, 'link-to-repo');
+  const linkToTmp = path.join(parent, 'link-to-tmp');
+  // Windows 用 junction（不需要管理员权限），其它平台用目录软链接。
+  const linkType = process.platform === 'win32' ? 'junction' : 'dir';
+  const makeLink = (target, link) => {
+    try {
+      fs.symlinkSync(target, link, linkType);
+      return true;
+    } catch {
+      return false;
+    }
+  };
+  const linkedRepo = makeLink(REPO_ROOT, linkToRepo);
+  const linkedTmp = makeLink(os.tmpdir(), linkToTmp);
+  try {
+    if (!linkedRepo && !linkedTmp) {
+      // 该文件系统不支持建链：退化为直接验证"同一判定函数对实路径的结论"必须是否决。
+      assert.equal(classifyTempParent(REPO_ROOT).ok, false);
+      assert.equal(classifyTempParent(os.tmpdir()).ok, false);
+      return;
+    }
+    if (linkedRepo) {
+      if (classifyTempParent(REPO_ROOT).ok) {
+        // 词法上在临时区里，实路径却指向仓库：必须按实路径拒绝
+        // （仓库自己就在临时区里的环境下，词法判定也会拒绝，同样安全，故这条只作旁证）。
+        assert.equal(classifyTempParent(linkToRepo).ok, true, '词法判定本来就该放过它（否则这条测不到实路径守卫）');
+      }
+      assert.throws(
+        () => assertSafeTempParent(linkToRepo),
+        (error) => error.code === 'unsafe-temp-dir' && error.detail === 'inside-repo',
+      );
+      assert.throws(
+        () => createHarness({ tempDir: linkToRepo }),
+        (error) => error.code === 'unsafe-temp-dir',
+      );
+    }
+    if (linkedTmp) {
+      // 实路径等于系统临时根：同样不算专用目录。
+      assert.throws(
+        () => assertSafeTempParent(linkToTmp),
+        (error) => error.code === 'unsafe-temp-dir' && error.detail === 'not-dedicated-root',
+      );
+    }
+  } finally {
+    // 先解链再删目录：绝不让递归删除顺着链接走进仓库 / 系统临时根。
+    for (const link of [linkToRepo, linkToTmp]) {
+      try {
+        if (fs.lstatSync(link).isSymbolicLink()) fs.unlinkSync(link);
+      } catch { /* 没建成就跳过 */ }
+    }
+    fs.rmSync(parent, { recursive: true, force: true });
+  }
+  assert.equal(fs.existsSync(parent), false);
 });
 
 test('隔离：writeFile 拒绝跳出临时目录的相对路径', () => {
@@ -243,18 +423,71 @@ test('隔离：writeFile 拒绝跳出临时目录的相对路径', () => {
 test('隔离：Windows 上大小写不同的临时目录/仓库路径仍按同一路径判定', { skip: process.platform !== 'win32' }, () => {
   // Git Bash / 小写盘符（c:/users/...）会传进来小写路径：不能因此误判"不在临时目录下"。
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'acc-case-'));
+  const lower = path.resolve(dir.toLowerCase());
   const harness = createHarness({ tempDir: dir.toLowerCase() });
   try {
-    assert.equal(harness.tempRoot, path.resolve(dir.toLowerCase()));
+    assert.equal(harness.tempParentRoot, lower);
+    // 根目录建在小写写法的父目录下（Windows 上同一条路径）。
+    assert.equal(path.dirname(harness.tempRoot).toLowerCase(), lower);
+    assert.ok(fs.existsSync(harness.tempRoot));
   } finally {
     harness.cleanup();
   }
+  assert.equal(fs.existsSync(harness.tempRoot), false, '小写路径下新建的目录没被清掉');
   fs.rmSync(dir, { recursive: true, force: true });
 
   // 仓库路径同理：小写写法也必须被识别成"在仓库里"，不能落盘。
   assert.throws(
     () => createHarness({ tempDir: path.join(REPO_ROOT.toLowerCase(), 'data') }),
-    (error) => error.code === 'unsafe-temp-dir',
+    (error) => error.code === 'unsafe-temp-dir' && error.detail === 'inside-repo',
+  );
+});
+
+test('隔离：WSL UNC 临时根上的专用父目录判定（合成路径，不触盘）', () => {
+  // WSL 里从 Windows 侧跑（或反过来）时临时根与仓库都可能写成 UNC：
+  // 判定必须按同一套规则走，不能因为写法特殊就放行。
+  const tmpRoot = String.raw`\\wsl.localhost\Ubuntu\tmp`;
+  const repoRoot = String.raw`\\wsl.localhost\Ubuntu\home\user\repo`;
+  const shareRoot = String.raw`\\wsl.localhost\Ubuntu` + '\\';
+  const verdict = (candidate, options = {}) => classifyTempParent(candidate, { tmpRoot, repoRoot, ...options });
+
+  // 系统临时根本身（带不带尾分隔符）→ 拒绝。
+  assert.deepEqual(verdict(tmpRoot), { ok: false, detail: 'not-dedicated-root' });
+  assert.deepEqual(verdict(tmpRoot + '\\'), { ok: false, detail: 'not-dedicated-root' });
+  // 仓库 / 仓库 data → 拒绝。
+  assert.deepEqual(verdict(repoRoot), { ok: false, detail: 'inside-repo' });
+  assert.deepEqual(verdict(repoRoot + '\\data'), { ok: false, detail: 'inside-repo' });
+  // UNC 共享根本身 → 太浅，拒绝（Windows 上识别为 root-path；其它平台算越界）。
+  assert.deepEqual(
+    verdict(shareRoot),
+    { ok: false, detail: process.platform === 'win32' ? 'root-path' : 'outside-os-tmp' },
+  );
+  // 同前缀但不是子目录（tmp vs tmpx）→ 不算在里面。
+  assert.deepEqual(
+    verdict(String.raw`\\wsl.localhost\Ubuntu\tmpx`),
+    { ok: false, detail: 'outside-os-tmp' },
+  );
+  // 另一台主机 / 本地盘符的临时目录 → 越界。
+  assert.deepEqual(verdict(String.raw`\\other-host\share\tmp\acc`), { ok: false, detail: 'outside-os-tmp' });
+  assert.deepEqual(verdict(String.raw`C:\Users\user\AppData\Local\Temp\acc`), { ok: false, detail: 'outside-os-tmp' });
+  // 真正的子目录 → 允许（父目录只是"往哪儿放"）。
+  const insideCandidate = tmpRoot + '\\acceptance-parent';
+  const inside = verdict(insideCandidate);
+  assert.equal(inside.ok, true);
+  assert.equal(inside.path.toLowerCase(), path.resolve(insideCandidate).toLowerCase());
+
+  // 大小写：Windows 语义（大小写不敏感）下允许，POSIX 语义下拒绝——判定不能靠运气。
+  const upper = String.raw`\\WSL.LOCALHOST\Ubuntu\TMP\acceptance-parent`;
+  assert.equal(verdict(upper, { caseInsensitive: true }).ok, true);
+  assert.equal(verdict(upper, { caseInsensitive: false }).ok, false);
+  assert.equal(verdict(upper, { caseInsensitive: false }).detail, 'outside-os-tmp');
+
+  // Windows 本地盘符的正常路径同样是"子目录允许、根与本盘其它位置拒绝"。
+  const winTmp = String.raw`C:\Users\user\AppData\Local\Temp`;
+  assert.equal(classifyTempParent(winTmp + '\\acc', { tmpRoot: winTmp, repoRoot }).ok, true);
+  assert.equal(
+    classifyTempParent(winTmp, { tmpRoot: winTmp, repoRoot }).detail,
+    'not-dedicated-root',
   );
 });
 
