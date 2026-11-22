@@ -509,17 +509,33 @@ test('隔离：软链接 / 联接点不得把专用父目录指到仓库或系�
   const parent = fs.mkdtempSync(path.join(os.tmpdir(), 'acc-link-'));
   const linkToRepo = path.join(parent, 'link-to-repo');
   const linkToTmp = path.join(parent, 'link-to-tmp');
-  // Windows 用 junction（不需要管理员权限），其它平台用目录软链接。
-  const linkType = process.platform === 'win32' ? 'junction' : 'dir';
-  const makeLink = (target, link) => {
+  const canResolve = (target) => {
     try {
-      fs.symlinkSync(target, link, linkType);
+      fs.realpathSync(target);
       return true;
     } catch {
       return false;
     }
   };
-  const linkedRepo = makeLink(REPO_ROOT, linkToRepo);
+  // Windows 用 junction（不需要管理员权限），其它平台用目录软链接。
+  // 例外：junction 只能指向本地卷，目标是 UNC 时（仓库在 \\wsl.localhost\... 下）
+  // 建出来的是一条**断链**（目录项在、lstat/realpath 都报 ENOENT），不能代表
+  // "指向仓库的链接"，所以 UNC 目标优先用目录符号链接。
+  const repoIsUnc = String(REPO_ROOT).startsWith('\\\\');
+  const junctionType = process.platform === 'win32' ? 'junction' : 'dir';
+  const makeLink = (target, link, type = junctionType) => {
+    try {
+      fs.symlinkSync(target, link, type);
+      return true;
+    } catch {
+      return false;
+    }
+  };
+  const linkedRepo = repoIsUnc
+    // UNC 目标：先试真正的目录链接；建不出来（无权限）就退回 junction，
+    // 走下面的"断链也必须拒绝"分支。
+    ? (makeLink(REPO_ROOT, linkToRepo, 'dir') || makeLink(REPO_ROOT, linkToRepo))
+    : makeLink(REPO_ROOT, linkToRepo);
   const linkedTmp = makeLink(os.tmpdir(), linkToTmp);
   try {
     if (!linkedRepo && !linkedTmp) {
@@ -529,19 +545,46 @@ test('隔离：软链接 / 联接点不得把专用父目录指到仓库或系�
       return;
     }
     if (linkedRepo) {
+      // 词法上它就在临时区里：必须靠实路径才拦得住（或识别出断链）。
       if (classifyTempParent(REPO_ROOT).ok) {
-        // 词法上在临时区里，实路径却指向仓库：必须按实路径拒绝
-        // （仓库自己就在临时区里的环境下，词法判定也会拒绝，同样安全，故这条只作旁证）。
         assert.equal(classifyTempParent(linkToRepo).ok, true, '词法判定本来就该放过它（否则这条测不到实路径守卫）');
       }
-      assert.throws(
-        () => assertSafeTempParent(linkToRepo),
-        (error) => error.code === 'unsafe-temp-dir' && error.detail === 'inside-repo',
-      );
-      assert.throws(
-        () => createHarness({ tempDir: linkToRepo }),
-        (error) => error.code === 'unsafe-temp-dir',
-      );
+      if (canResolve(linkToRepo)) {
+        // 正常情况（Windows 本地仓库 / UNC 仓库 + 目录符号链接）：实路径指向仓库，
+        // 必须按实路径判成 inside-repo——这条断言不打折。
+        const norm = (value) => (process.platform === 'win32' ? String(value).toLowerCase() : String(value));
+        assert.equal(
+          norm(fs.realpathSync(linkToRepo)).startsWith(norm(REPO_ROOT)),
+          true,
+          '链接没能解析到仓库：这条用例就不再证明"实路径守卫"了',
+        );
+        assert.throws(
+          () => assertSafeTempParent(linkToRepo),
+          (error) => error.code === 'unsafe-temp-dir' && error.detail === 'inside-repo',
+        );
+        assert.throws(
+          () => createHarness({ tempDir: linkToRepo }),
+          (error) => error.code === 'unsafe-temp-dir' && error.detail === 'inside-repo',
+        );
+      } else {
+        // 降级：链接解析不出实路径（Windows 上 junction 指向 UNC 就是这种断链）。
+        // 仍然是拒绝，但理由必须是"目录项在、解析不出真实路径"，不能被悄悄当成
+        // "路径不存在"或别的笼统失败。
+        assert.equal(
+          fs.readdirSync(parent).includes(path.basename(linkToRepo)),
+          true,
+          '断链应当作为目录项存在，否则测的就不是"解析不出实路径"',
+        );
+        assert.equal(fs.existsSync(linkToRepo), false, '断链不该被 existsSync 当成存在');
+        assert.throws(
+          () => assertSafeTempParent(linkToRepo),
+          (error) => error.code === 'unsafe-temp-dir' && error.detail === 'unresolvable-real-path',
+        );
+        assert.throws(
+          () => createHarness({ tempDir: linkToRepo }),
+          (error) => error.code === 'unsafe-temp-dir' && error.detail === 'unresolvable-real-path',
+        );
+      }
     }
     if (linkedTmp) {
       // 实路径等于系统临时根：同样不算专用目录。
@@ -555,11 +598,60 @@ test('隔离：软链接 / 联接点不得把专用父目录指到仓库或系�
     for (const link of [linkToRepo, linkToTmp]) {
       try {
         if (fs.lstatSync(link).isSymbolicLink()) fs.unlinkSync(link);
-      } catch { /* 没建成就跳过 */ }
+      } catch {
+        // 断链 / 非法重解析点 lstat 会报 ENOENT，只能按目录项移除。
+        try { fs.rmdirSync(link); } catch { /* 没建成就跳过 */ }
+      }
     }
     fs.rmSync(parent, { recursive: true, force: true });
   }
   assert.equal(fs.existsSync(parent), false);
+});
+
+test('隔离：目录项存在但解析不出实路径（断链）按 unresolvable-real-path 拒绝', () => {
+  const parent = fs.mkdtempSync(path.join(os.tmpdir(), 'acc-dangling-'));
+  const target = path.join(parent, 'gone-target');
+  const link = path.join(parent, 'link-to-gone');
+  const linkType = process.platform === 'win32' ? 'junction' : 'dir';
+  fs.mkdirSync(target);
+  let linked = true;
+  try {
+    fs.symlinkSync(target, link, linkType);
+  } catch {
+    linked = false;
+  }
+  try {
+    if (!linked) {
+      // 建不了链的环境：至少确认词法判定不会把链接路径当成"越界"而混淆理由。
+      assert.equal(classifyTempParent(link).ok, true);
+      return;
+    }
+    // 目标消失 → 目录项还在，但解析不出真实路径。
+    fs.rmSync(target, { recursive: true, force: true });
+    assert.equal(fs.readdirSync(parent).includes('link-to-gone'), true, '断链应当仍然是个目录项');
+    assert.equal(fs.existsSync(link), false, '断链不该被 existsSync 当成存在');
+    assert.equal(classifyTempParent(link).ok, true, '词法判定本来就该放过它');
+    assert.throws(
+      () => assertSafeTempParent(link),
+      (error) => error.code === 'unsafe-temp-dir' && error.detail === 'unresolvable-real-path',
+    );
+    assert.throws(
+      () => createHarness({ tempDir: link }),
+      (error) => error.code === 'unsafe-temp-dir' && error.detail === 'unresolvable-real-path',
+    );
+    // 真正的"路径不存在"仍然是 parent-missing：两种理由不能混成一句。
+    assert.throws(
+      () => assertSafeTempParent(path.join(parent, 'never-existed')),
+      (error) => error.code === 'unsafe-temp-dir' && error.detail === 'parent-missing',
+    );
+  } finally {
+    try {
+      if (fs.lstatSync(link).isSymbolicLink()) fs.unlinkSync(link);
+    } catch {
+      try { fs.rmdirSync(link); } catch { /* 没建成就跳过 */ }
+    }
+    fs.rmSync(parent, { recursive: true, force: true });
+  }
 });
 
 test('隔离：writeFile 拒绝跳出临时目录的相对路径', () => {

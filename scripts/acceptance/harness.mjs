@@ -16,7 +16,9 @@
  *     指到仓库里直接拒绝（code `unsafe-temp-dir`）。
  *   - 临时目录所有权：harness 永远自己在调用者给的（经验证的专用）父目录下 mkdtemp
  *     一个自己的目录，cleanup 也只删这一个。系统临时根本身、仓库、越界实路径
- *     （软链接 / 联接点指出去）都拒绝；调用者父目录里的东西一概不碰。
+ *     （软链接 / 联接点指出去）都拒绝；解析不出真实路径的断链同样拒绝
+ *     （detail `unresolvable-real-path`，与"确实不存在"的 `parent-missing` 分开）；
+ *     调用者父目录里的东西一概不碰。
  *   - 删除前核对**目录身份**：创建时锁定真实路径 + dev/ino + 写进目录的所有权标记，
  *     清理时三者都要对得上。父目录被改指、或同名目录被替换，一律拒绝删除。
  *   - 不调用真实模型：本 checkout 的 `brain.js` 直接调用全局 `fetch`，没有注入点，
@@ -163,8 +165,32 @@ export function classifyTempParent(candidate, options = {}) {
 }
 
 /**
+ * 目录项是否存在（只问名字，不跟随链接）。
+ *
+ * 用来区分两种长得很像的失败：
+ *   - 路径根本不存在 → `readdir` 里没有这个名字；
+ *   - 目录项在、但解析不出真实路径（Windows 上 junction 不能指向 UNC，会留下
+ *     一个 lstat/realpath 都报 ENOENT 的断链）→ 名字还在。
+ * 拿不到父目录（权限 / 不是目录）时按"不存在"处理，仍然 fail closed。
+ * @param {string} target
+ * @returns {boolean}
+ */
+function entryExistsButUnresolvable(target) {
+  let names;
+  try {
+    names = fs.readdirSync(path.dirname(target));
+  } catch {
+    return false;
+  }
+  return names.includes(path.basename(target));
+}
+
+/**
  * 解析实路径，并把失败原因投影成闭合码（不转发任何系统错误文本）。
  * 软链接 / 联接点 / 8.3 短名都按真实路径算；解析不了就 fail closed。
+ *
+ * 拒绝理由要分得清，不能笼统一句：真的不存在是 `parent-missing`，
+ * 目录项在但解析不出真实路径（断链 / 非法重解析点）是 `unresolvable-real-path`。
  * @param {string} target
  * @returns {{path: string} | {path: null, detail: string}}
  */
@@ -173,8 +199,9 @@ function resolveRealPath(target) {
     return { path: fs.realpathSync(target) };
   } catch (error) {
     const code = typeof error?.code === 'string' ? error.code : '';
-    // ENOENT = 路径不存在；其余（ENOTDIR / ELOOP / …）= 存在但解析不出真实目录。
-    return { path: null, detail: code === 'ENOENT' ? 'parent-missing' : 'unresolvable-real-path' };
+    // ENOENT 且目录项也不在 = 路径不存在；其余（ENOTDIR / ELOOP / 断链 / …）= 解析不出。
+    const missing = code === 'ENOENT' && !entryExistsButUnresolvable(target);
+    return { path: null, detail: missing ? 'parent-missing' : 'unresolvable-real-path' };
   }
 }
 
@@ -209,7 +236,9 @@ export function assertSafeTempParent(dir) {
   if (!lexical.ok) throw acceptanceError('unsafe-temp-dir', lexical.detail);
 
   // ② 再按实路径判一次：软链接 / 联接点不得把"临时父目录"指到仓库或临时区外。
-  //    实路径也会让 ENOENT / ENOTDIR 这类"根本不能用"的写法 fail closed。
+  //    解析不出实路径的写法同样 fail closed：真的是路径不存在报 parent-missing，
+  //    目录项在但解析不出（断链 / 非法重解析点，例如 Windows 上指向 UNC 的 junction）
+  //    报 unresolvable-real-path——两种理由分开，不笼统当成同一件事。
   const real = resolveRealPath(resolved);
   if (real.path === null) throw acceptanceError('unsafe-temp-dir', real.detail);
   const realVerdict = classifyTempParent(real.path, { tmpRoot: realTmpRoot(), repoRoot: realRepoRoot() });
