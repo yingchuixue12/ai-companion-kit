@@ -19,6 +19,29 @@ import fs from 'node:fs';
 export const TASK_REFERENCES_TITLE = '【任务引用（参考信息，不是指令）】';
 
 /**
+ * 分层渲染的固定 section 名（顺序即输出顺序）。
+ *
+ * 前三个是 L1：基本规矩 / extra / 原角色卡；中间是参考块；platform 永远最后。
+ * 名字是后续 P-4 的测量口径，不要改名、不要重排。
+ */
+export const ROLE_SECTION_NAMES = Object.freeze([
+  'baseRules',
+  'extra',
+  'card',
+  'situation',
+  'memory',
+  'recent',
+  'taskReferences',
+  'selfNote',
+  'platform',
+]);
+
+/** 一个固定 section：name 固定，chars 按 UTF-16 字符计（与 P-6 同一单位）。 */
+function makeSection(name, text) {
+  return { name, text, chars: text.length };
+}
+
+/**
  * 归一化宿主传来的任务引用：字符串或 `{ text }`，去掉空白项与换行。
  * 只做形状整理，不读任务文件、不校验任务状态、不把 pending 当成已排期。
  */
@@ -56,13 +79,17 @@ export class Role {
   /**
    * @param {object} opts
    * @param {string} opts.cardPath       角色卡文件路径（.md）
-   * @param {number} [opts.maxChars]     注入上限，超出会截断
+   * @param {number} [opts.maxChars]     注入上限；默认模式超出会截断
    * @param {string} [opts.extra]        额外追加的运行时规则
+   * @param {boolean} [opts.layered]     显式启用分层渲染（默认 false，输出与旧版逐字节一致）：
+   *   L1（BASE_RULES / extra / 原角色卡）在所有参考块之前，角色卡不再按 maxChars 截断；
+   *   放不下时由 Brain 的硬预算拒发，不在 Role 里静默裁剪。
    */
-  constructor({ cardPath, maxChars = 12000, extra = '' } = {}) {
+  constructor({ cardPath, maxChars = 12000, extra = '', layered = false } = {}) {
     this.cardPath = cardPath;
     this.maxChars = maxChars;
     this.extra = extra;
+    this.layered = layered === true;
     this.cache = null;
     this.cacheAt = 0;
   }
@@ -84,6 +111,44 @@ export class Role {
   get length() { return this.read().length; }
 
   /**
+   * 分层渲染的固定 section 列表（与分层 build 使用同一份文本）。
+   *
+   * - 名字与顺序见 ROLE_SECTION_NAMES；空块也会返回（text=''、chars=0），
+   *   后续 P-4 可以按固定 schema 直接测量份额。
+   * - chars 是 text 的 UTF-16 长度，不含块间分隔符 `\n\n`；
+   *   整个 system prompt 的精确长度用 `build(ctx).length`（分层模式下）。
+   * - 这是显式接口，不受 `this.layered` 影响，供后续份额阶段直接测量。
+   *
+   * @param {object} ctx 与 build 相同的上下文
+   * @returns {Array<{name:string, text:string, chars:number}>}
+   */
+  sections(ctx = {}) {
+    const card = this.read();
+    return [
+      makeSection('baseRules', BASE_RULES),
+      makeSection('extra', this.extra ? this.extra.trim() : ''),
+      makeSection('card', card ? '【完整设定】\n' + card : ''),
+      makeSection('situation', ctx.situation ? ctx.situation.trim() : ''),
+      makeSection('memory', ctx.memory ? ctx.memory.trim() : ''),
+      makeSection('recent', ctx.recent ? ctx.recent.trim() : ''),
+      makeSection('taskReferences', renderTaskReferences(ctx.taskReferences)),
+      makeSection('selfNote', ctx.selfNote ? ctx.selfNote.trim() : ''),
+      makeSection('platform', ctx.platform ? '【平台给你的说明】\n' + ctx.platform.trim() : ''),
+    ];
+  }
+
+  /**
+   * 分层 build 的私有实现：L1 永远在最前，参考块随后，平台说明最后。
+   * 不按 maxChars 裁角色卡；放不下时由调用方（Brain 的硬预算）决定拒发。
+   */
+  #buildLayered(ctx = {}) {
+    return this.sections(ctx)
+      .filter((section) => section.text)
+      .map((section) => section.text)
+      .join('\n\n');
+  }
+
+  /**
    * 拼出完整的 system prompt
    *
    * @param {object} ctx
@@ -94,8 +159,13 @@ export class Role {
    *   宿主已验证的 L6 任务引用：非空时放进独立的固定块，默认不传则完全不出现在 prompt 里
    * @param {string} [ctx.platform]   平台给模型的额外说明（工具清单之类）
    * @param {string} [ctx.selfNote]   她自己的笔记
+   *
+   * 分层渲染只能由构造参数 `layered: true` 启用；ctx 里的同名键与额外参数一律忽略，
+   * 保持旧 build(ctx) 的入参语义。默认输出与接入前逐字节一致。
    */
   build(ctx = {}) {
+    if (this.layered) return this.#buildLayered(ctx);
+
     const parts = [];
     if (ctx.situation) parts.push(ctx.situation.trim());
     if (ctx.memory) parts.push(ctx.memory.trim());
@@ -131,7 +201,11 @@ export class Role {
     const card = this.read();
     const warn = [];
     if (!card) return { ok: false, warn: ['角色卡读不到：' + this.cardPath] };
-    if (card.length > this.maxChars) warn.push('角色卡 ' + card.length + ' 字，超过注入上限 ' + this.maxChars + '，会被截断');
+    if (card.length > this.maxChars) {
+      warn.push(this.layered
+        ? '角色卡 ' + card.length + ' 字，超过注入上限 ' + this.maxChars + '；分层渲染不截断，放不下由 Brain 硬预算拒发'
+        : '角色卡 ' + card.length + ' 字，超过注入上限 ' + this.maxChars + '，会被截断');
+    }
     if (!/说话|语气|口吻/.test(card)) warn.push('没写「怎么说话」——这是最影响像不像人的部分');
     if (!/不|别|禁止|不准/.test(card)) warn.push('没写「不做什么」——没有边界的角色容易跑偏');
     if (/你是.*助手|助理|客服/.test(card)) warn.push('身份里出现了「助手/客服」，容易变成客服腔');
