@@ -3,6 +3,11 @@
  * ─────────────────────────────────────────────────────────────
  * 本文件只补「统一离线矩阵」里的 C 门，不改产品、不接真实平台：
  *
+ *   C-01  Web presence HTTP：真实 web host + 真实 web-http handler 挂在临时回环
+ *         server 上，用 HTTP 客户端验证欢迎、休息、欢迎冷却限流、
+ *         内容盲 / 禁止正文、禁用清空
+ *   C-02  Web presence 重启：同一状态文件上的新实例恢复冷却与会话、
+ *         旧游标不补发旧欢迎、过冷却后可产生新事件
  *   C-03  QQ presence 默认关闭（配置缺省即关，不建状态、不发主动消息）
  *   C-04  开启后投递：真实 Humanizer → 合成 OneBot sendPrivateText；
  *         sent / accepted 严格分离，accepted 只占额度、不算送达
@@ -14,7 +19,9 @@
  *
  * ── 证据边界（必须在报告里一起读）──────────────────────────
  *   - 全部是离线合成证据：合成 owner / 合成文案 / 合成 OneBot；
- *     不连 QQ、OneBot、HTTP，不调真实模型，不读写仓库 data/ 或真实配置。
+ *     不连 QQ、OneBot、不调真实模型，不读写仓库 data/ 或真实配置。
+ *   - C-01/C-02 唯一的"网络"是本进程里的临时回环 HTTP server（127.0.0.1 随机端口），
+ *     只服务 /presence/signal 与 /presence/messages；不连外网、不改全局 fetch。
  *   - 时钟由 harness 虚拟时钟注入；时间只用于状态机、冷却、日上限与 TTL。
  *   - C-04 只证明「离线运行层 + 合成 OneBot」这一半；真实平台回执仍属 T9，
  *     不因本场景 pass 而视为 C-04 真实平台部分通过。
@@ -27,12 +34,16 @@
  */
 import fs from 'node:fs';
 import path from 'node:path';
+import { once } from 'node:events';
+import { createServer, request as httpRequest } from 'node:http';
 
 import { Humanizer } from '../../packages/companion/src/humanize.js';
 import { PresenceRuntime } from '../../packages/companion/src/presence-runtime.js';
 import { createPresenceQQAdapter } from '../../packages/companion/src/presence/qq-adapter.js';
 import { createPresenceSession } from '../../packages/companion/src/presence/session.js';
 import { createPresenceQQHost } from '../../packages/companion/src/presence-qq-runtime.js';
+import { createPresenceWebHost } from '../../packages/companion/src/presence/web-host.js';
+import { createPresenceHttpHandler } from '../../packages/companion/src/presence/web-http.js';
 import { loadConfig, main } from '../../packages/companion/src/index.js';
 
 /** 合成账号 / 状态文件名：占位值，不对应任何真实账号。 */
@@ -998,32 +1009,551 @@ async function runC09(harness) {
   };
 }
 
+/* ══════════════════════ C-01 / C-02 Web presence HTTP ══════════════════════ */
+
+const WEB_MINUTE = 60 * 1000;
+const WEB_AUTH_HEADER = 'x-acceptance-auth';
+const WEB_AUTH_TOKEN = 'synthetic-loopback-token';
+const WEB_ACTIVITY_BODY = '{"kind":"activity","active":true}';
+const WEB_HOST_STATE_FILE = 'presence-web-state.json';
+const WEB_WELCOME_SETTINGS = {
+  idleMs: 5 * WEB_MINUTE,
+  awayMs: 30 * WEB_MINUTE,
+  returnAfterMs: 5 * WEB_MINUTE,
+  workAfterMs: 50 * WEB_MINUTE,
+  cooldownMs: 90 * WEB_MINUTE,
+};
+const WEB_BREAK_SETTINGS = { ...WEB_WELCOME_SETTINGS, idleMs: 60 * WEB_MINUTE, awayMs: 120 * WEB_MINUTE };
+
+/**
+ * 在临时回环 HTTP 服务上挂载真实公开 Web host + 真实 web-http handler。
+ * web-http 的文档契约：认证、结算拍与生命周期归挂载方——所以 settle()/setEnabled()
+ * 由场景以挂载方身份调用；HTTP 客户端只打 /presence/signal 与 /presence/messages。
+ * 认证是合成 header 闸门（authorize 回调），不是真实部署认证。
+ */
+async function createWebHostFixture(harness, { root, settings, withStateFile = true, stateFile } = {}) {
+  const dataDir = harness.dirOf(root);
+  const resolvedStateFile = stateFile !== undefined
+    ? stateFile
+    : (withStateFile ? path.join(dataDir, WEB_HOST_STATE_FILE) : null);
+  const journal = [];
+  const host = createPresenceWebHost({
+    enabled: true,
+    settings,
+    now: () => harness.now(),
+    journal: (event) => journal.push(event),
+    ...(resolvedStateFile ? { stateFile: resolvedStateFile } : {}),
+  });
+  const authorize = (req) => req.headers[WEB_AUTH_HEADER] === WEB_AUTH_TOKEN;
+  const handler = createPresenceHttpHandler({ host, authorize });
+  const server = createServer(async (req, res) => {
+    if (!await handler(req, res)) {
+      res.writeHead(404, { 'Content-Type': 'application/json; charset=utf-8' });
+      res.end(JSON.stringify({ error: 'not-found' }));
+    }
+  });
+  server.listen(0, '127.0.0.1');
+  await once(server, 'listening');
+  const call = (route, { method = 'GET', body, headers = {} } = {}) => new Promise((resolve, reject) => {
+    const outgoing = httpRequest({
+      host: '127.0.0.1',
+      port: server.address().port,
+      path: route,
+      method,
+      headers: { [WEB_AUTH_HEADER]: WEB_AUTH_TOKEN, ...headers },
+      agent: false,
+    }, (incoming) => {
+      let data = '';
+      incoming.setEncoding('utf8');
+      incoming.on('data', (chunk) => { data += chunk; });
+      incoming.on('end', () => resolve({
+        code: incoming.statusCode,
+        contentType: String(incoming.headers['content-type'] ?? ''),
+        cacheControl: String(incoming.headers['cache-control'] ?? ''),
+        body: data ? JSON.parse(data) : null,
+        raw: data,
+      }));
+      incoming.on('error', reject);
+    });
+    outgoing.on('error', reject);
+    outgoing.end(body);
+  });
+  return {
+    host,
+    journal,
+    stateFile: resolvedStateFile,
+    signal: (rawBody, extraHeaders = {}) => call('/presence/signal', {
+      method: 'POST',
+      body: rawBody,
+      headers: { 'content-type': 'application/json', ...extraHeaders },
+    }),
+    messages: (after) => call('/presence/messages' + (after ? '?after=' + encodeURIComponent(after) : '')),
+    close: async () => {
+      host.close();
+      await new Promise((resolve) => server.close(resolve));
+    },
+  };
+}
+
+function webMessageKinds(page) {
+  return (Array.isArray(page?.body?.messages) ? page.body.messages : [])
+    .map((message) => (typeof message?.kind === 'string' ? message.kind : ''))
+    .join('|');
+}
+
+function webHasTextField(value) {
+  return /"text"\s*:/u.test(JSON.stringify(value ?? null));
+}
+
+function webJournalIntents(journal) {
+  return journal.filter((event) => event.type === 'presence-web-intent').length;
+}
+
+/**
+ * C-01：Web presence 走 HTTP。真实 web host + 真实 web-http handler 挂在临时回环
+ * server 上，全部用 HTTP 客户端验证：欢迎、休息提醒、欢迎冷却限流、
+ * 内容盲 / 禁止正文（带正文的信号在 HTTP 入口就被拒收，正文进不了
+ * 状态文件 / 提示队列 / 日志）、禁用清空。
+ */
+async function runC01(harness) {
+  const SECRET = 'SECRET-web-body-3f7a';
+  const web = await createWebHostFixture(harness, { root: 'c01/welcome', settings: WEB_WELCOME_SETTINGS });
+  const brk = await createWebHostFixture(harness, { root: 'c01/break', settings: WEB_BREAK_SETTINGS });
+  const off = await createWebHostFixture(harness, { root: 'c01/disable', settings: WEB_WELCOME_SETTINGS });
+  try {
+    /* ── 欢迎投递 ── */
+    const initial = await web.messages();
+    const entered = await web.signal(WEB_ACTIVITY_BODY);
+    harness.advanceClock(31 * WEB_MINUTE);
+    const awayStep = web.host.settle();
+    harness.advanceClock(6 * WEB_MINUTE);
+    const returned = await web.signal(WEB_ACTIVITY_BODY);
+    const welcomePage = await web.messages(initial.body.cursor);
+    const welcome = welcomePage.body.messages[0] ?? null;
+    const replay = await web.messages(welcomePage.body.cursor);
+
+    harness.step({
+      title: 'C-01 欢迎：POST /presence/signal → away → 回来后 GET /presence/messages 交付一条 welcome-back',
+      input: {
+        kind: 'presence-web-http',
+        note: '真实 web-host + 真实 web-http handler，临时回环 127.0.0.1 随机端口；虚拟时钟推进',
+      },
+      model: { calls: 0 },
+      delivery: {
+        attempted: 1,
+        sent: 0,
+        receipts: ['queued'],
+        texts: welcome ? [welcome.text] : [],
+        channel: 'web-http-messages',
+      },
+      expected: {
+        initialCode: 200, initialMessages: 0, noStore: true, jsonContentType: true,
+        signalCode: 200, signalOk: true, signalStatus: 'ok',
+        settleStatus: 'ok', settleState: 'away',
+        returnCode: 200,
+        welcomeKinds: 'welcome-back', welcomeCount: 1,
+        welcomeTextNonEmpty: true, welcomeAtSet: true,
+        replayCount: 0, journalIntents: 1,
+      },
+      actual: {
+        initialCode: initial.code,
+        initialMessages: initial.body.messages.length,
+        noStore: initial.cacheControl === 'no-store',
+        jsonContentType: initial.contentType.startsWith('application/json'),
+        signalCode: entered.code,
+        signalOk: entered.body.ok === true,
+        signalStatus: entered.body.status ?? '',
+        settleStatus: awayStep.status,
+        settleState: awayStep.state,
+        returnCode: returned.code,
+        welcomeKinds: webMessageKinds(welcomePage),
+        welcomeCount: welcomePage.body.messages.length,
+        welcomeTextNonEmpty: typeof welcome?.text === 'string' && welcome.text.length > 0,
+        welcomeAtSet: typeof welcome?.at === 'string' && welcome.at.length > 0,
+        replayCount: replay.body.messages.length,
+        journalIntents: webJournalIntents(web.journal),
+      },
+    });
+
+    /* ── 欢迎冷却限流 ── */
+    harness.advanceClock(31 * WEB_MINUTE);
+    web.host.settle();
+    harness.advanceClock(6 * WEB_MINUTE);
+    const gatedReturn = await web.signal(WEB_ACTIVITY_BODY);
+    const gatedPage = await web.messages(welcomePage.body.cursor);
+
+    harness.step({
+      title: 'C-01 限流：欢迎冷却期内再走一轮 away → 回来，welcome 被冷却扣下、不补发',
+      input: {
+        kind: 'presence-web-http',
+        note: '距上次欢迎 74 分钟 < 90 分钟冷却（cooldownMs）',
+      },
+      model: { calls: 0 },
+      expected: {
+        returnCode: 200, returnOk: true,
+        pageKinds: '', pageCount: 0,
+        pending: 1,
+      },
+      actual: {
+        returnCode: gatedReturn.code,
+        returnOk: gatedReturn.body.ok === true,
+        pageKinds: webMessageKinds(gatedPage),
+        pageCount: gatedPage.body.messages.length,
+        pending: web.host.pending,
+      },
+    });
+
+    /* ── 休息提醒 ── */
+    const brkInitial = await brk.messages();
+    await brk.signal(WEB_ACTIVITY_BODY);
+    harness.advanceClock(51 * WEB_MINUTE);
+    const brkSettle = brk.host.settle();
+    const brkPage = await brk.messages(brkInitial.body.cursor);
+    harness.advanceClock(5 * WEB_MINUTE);
+    const brkAgain = brk.host.settle();
+    const brkNext = await brk.messages(brkPage.body.cursor);
+
+    harness.step({
+      title: 'C-01 休息：持续在场 51 分钟（workAfterMs=50）→ 一条 break-reminder；同会话不重提',
+      input: {
+        kind: 'presence-web-http',
+        note: '独立 fixture：idleMs=60min、awayMs=120min，settle 前仍 present',
+      },
+      model: { calls: 0 },
+      delivery: {
+        attempted: 1,
+        sent: 0,
+        receipts: ['queued'],
+        texts: brkPage.body.messages.map((message) => message.text),
+        channel: 'web-http-messages',
+      },
+      expected: {
+        settleStatus: 'ok', settleState: 'present',
+        breakKinds: 'break-reminder', breakCount: 1,
+        againState: 'present', nextCount: 0,
+      },
+      actual: {
+        settleStatus: brkSettle.status,
+        settleState: brkSettle.state,
+        breakKinds: webMessageKinds(brkPage),
+        breakCount: brkPage.body.messages.length,
+        againState: brkAgain.state,
+        nextCount: brkNext.body.messages.length,
+      },
+    });
+
+    /* ── 内容盲 / 禁止正文 ── */
+    const pendingBefore = web.host.pending;
+    const rejected = [];
+    for (const raw of [
+      '{"kind":"activity","active":true,"text":"' + SECRET + '"}',
+      '{"kind":"activity","active":true,"url":"https://synthetic.invalid/x","title":"t"}',
+      '{"kind":"heartbeat","alive":true,"active":true}',
+      '{"kind":"constructor","active":true}',
+    ]) {
+      rejected.push(await web.signal(raw));
+    }
+    const pendingAfterRejects = web.host.pending;
+    const heartbeat = await web.signal('{"kind":"heartbeat","alive":true}');
+
+    harness.step({
+      title: 'C-01 内容盲：带正文的信号在 HTTP 入口被拒收；合法 kind+布尔量照常通过，正文进不了状态/队列/日志',
+      input: {
+        kind: 'presence-web-http',
+        note: '四种非法体：多余 text / url+title / kind-flag 混用 / 未知 kind；响应只留闭合码',
+      },
+      model: { calls: 0 },
+      expected: {
+        rejectCodes: '400|400|400|400',
+        rejectErrors: 'invalid-signal|invalid-signal|invalid-signal|invalid-signal',
+        rejectNoEcho: true,
+        heartbeatCode: 200, heartbeatOk: true,
+        pendingUnchanged: true,
+        welcomeNoSecret: true,
+        secretNotPersisted: true,
+        secretNotInJournal: true,
+        stateHasTextField: false,
+      },
+      actual: {
+        rejectCodes: rejected.map((response) => String(response.code)).join('|'),
+        rejectErrors: rejected.map((response) => response.body?.error ?? '').join('|'),
+        rejectNoEcho: rejected.every((response) => !response.raw.includes(SECRET)),
+        heartbeatCode: heartbeat.code,
+        heartbeatOk: heartbeat.body.ok === true,
+        pendingUnchanged: pendingAfterRejects === pendingBefore,
+        welcomeNoSecret: !(welcome?.text ?? '').includes(SECRET),
+        secretNotPersisted: !fs.readFileSync(web.stateFile, 'utf8').includes(SECRET),
+        secretNotInJournal: !JSON.stringify(web.journal).includes(SECRET),
+        stateHasTextField: webHasTextField(readState(web.stateFile)),
+      },
+    });
+
+    /* ── 禁用清空 ── */
+    const offInitial = await off.messages();
+    await off.signal(WEB_ACTIVITY_BODY);
+    harness.advanceClock(31 * WEB_MINUTE);
+    off.host.settle();
+    harness.advanceClock(6 * WEB_MINUTE);
+    await off.signal(WEB_ACTIVITY_BODY);
+    const offPage = await off.messages(offInitial.body.cursor);
+    const disabled = off.host.setEnabled(false);
+    const pageAfterDisable = await off.messages(offPage.body.cursor);
+    const observeAfterDisable = await off.signal(WEB_ACTIVITY_BODY);
+
+    harness.step({
+      title: 'C-01 禁用清空：setEnabled(false) 清空队列、删状态文件；之后 signal 返回 409 disabled',
+      input: {
+        kind: 'presence-web-http',
+        note: '禁用先清队列再清持久化（承诺式 clear）；清不干净则不允许再启用（fail-closed）',
+      },
+      model: { calls: 0 },
+      expected: {
+        welcomeKinds: 'welcome-back',
+        disableEnabled: true, disableDropped: 1, disableCleared: true,
+        stateGone: true,
+        pageAfterCount: 0,
+        observeCode: 409, observeOk: true, observeStatus: 'disabled',
+        pendingZero: true,
+      },
+      actual: {
+        welcomeKinds: webMessageKinds(offPage),
+        disableEnabled: disabled.enabled === false,
+        disableDropped: disabled.dropped,
+        disableCleared: disabled.cleared === true,
+        stateGone: !fs.existsSync(off.stateFile),
+        pageAfterCount: pageAfterDisable.body.messages.length,
+        observeCode: observeAfterDisable.code,
+        observeOk: observeAfterDisable.body.ok === false,
+        observeStatus: observeAfterDisable.body.status ?? '',
+        pendingZero: off.host.pending === 0,
+      },
+    });
+
+    return {
+      modules: [
+        'presence/web-host.js',
+        'presence/web-http.js',
+        'presence/session.js',
+        'presence/persistence.js',
+        'presence-runtime.js',
+        'presence-interaction.js',
+      ],
+      limitation: 'web-presence-http-loopback-offline',
+      note: '真实公开 Web host + 真实 web-http handler 挂在临时回环 server（127.0.0.1 随机端口）；'
+        + 'HTTP 客户端只打 /presence/signal 与 /presence/messages；settle()/禁用是挂载方节拍（web-http 文档契约）。'
+        + '认证是合成 header 闸门，不是真实部署认证；不证明真实浏览器/页面/T6 芙兰宿主验收。',
+      settings: { welcome: WEB_WELCOME_SETTINGS, break: WEB_BREAK_SETTINGS },
+      authBoundary: 'synthetic-header-authorize',
+    };
+  } finally {
+    await web.close();
+    await brk.close();
+    await off.close();
+  }
+}
+
+/**
+ * C-02：Web presence 重启。同一状态文件上的新实例：恢复冷却与会话锚点、
+ * 旧游标不补发旧欢迎、冷却期内的新一轮 away → 回来仍被扣下、
+ * 过冷却后可以产生新的 welcome 事件。
+ */
+async function runC02(harness) {
+  const settings = WEB_WELCOME_SETTINGS;
+  const stateFile = path.join(harness.dirOf('c02/state'), WEB_HOST_STATE_FILE);
+  const first = await createWebHostFixture(harness, {
+    root: 'c02/first', settings, withStateFile: false, stateFile,
+  });
+  try {
+    /* ── 重启前：产生一次欢迎并落盘 ── */
+    const initial = await first.messages();
+    await first.signal(WEB_ACTIVITY_BODY);
+    harness.advanceClock(31 * WEB_MINUTE);
+    first.host.settle();
+    harness.advanceClock(6 * WEB_MINUTE);
+    await first.signal(WEB_ACTIVITY_BODY);
+    const firstPage = await first.messages(initial.body.cursor);
+    const firstWelcome = firstPage.body.messages[0] ?? null;
+    const firstWelcomeAt = harness.now();
+    const firstCursor = firstPage.body.cursor;
+    const firstMessageId = firstWelcome?.id ?? '';
+    const closedFirst = first.host.close();
+
+    /* ── 同一状态文件上的新实例 ── */
+    const second = await createWebHostFixture(harness, {
+      root: 'c02/second', settings, withStateFile: false, stateFile,
+    });
+    try {
+      const stateAfterRestart = readState(stateFile);
+
+      harness.step({
+        title: 'C-02 共享状态文件：新实例 restored=true，冷却锚点（cooldowns.welcome）与关闭落盘一致',
+        input: {
+          kind: 'presence-web-http-restart',
+          note: '同一 stateFile 上的第二个 web host 实例；同一虚拟时钟；不是 OS 进程级重启',
+        },
+        model: { calls: 0 },
+        expected: {
+          closePersisted: true,
+          restoredTrue: true, statusReady: true,
+          sameStateFile: true,
+          restoredDiagnostic: true,
+          cooldownWelcome: firstWelcomeAt,
+          deliveredLedger: 0,
+        },
+        actual: {
+          closePersisted: closedFirst.persisted === true,
+          restoredTrue: second.host.restored === true,
+          statusReady: second.host.status === 'ready',
+          sameStateFile: second.host.stateFile === stateFile,
+          restoredDiagnostic: second.host.diagnostics.some((entry) => entry.code === 'presence-web-restored'),
+          cooldownWelcome: stateAfterRestart?.cooldowns?.welcome ?? null,
+          deliveredLedger: Array.isArray(stateAfterRestart?.deliveredIds) ? stateAfterRestart.deliveredIds.length : -1,
+        },
+      });
+
+      /* ── 无旧欢迎补发 ── */
+      const oldCursorPage = await second.messages(firstCursor);
+      const freshPage = await second.messages();
+
+      harness.step({
+        title: 'C-02 无旧欢迎补发：旧实例游标（epoch 失配）与首读都只拿到空页',
+        input: {
+          kind: 'presence-web-http-restart',
+          note: '游标带实例 id：重启后旧游标永远匹配不上；不传 after 不回放',
+        },
+        model: { calls: 0 },
+        expected: {
+          oldCursorCount: 0,
+          freshCount: 0,
+          pendingZero: true,
+          journalHasTextField: false,
+        },
+        actual: {
+          oldCursorCount: oldCursorPage.body.messages.length,
+          freshCount: freshPage.body.messages.length,
+          pendingZero: second.host.pending === 0,
+          journalHasTextField: webHasTextField(second.journal),
+        },
+      });
+
+      /* ── 冷却恢复：冷却期内的新一轮仍被扣下 ── */
+      harness.advanceClock(31 * WEB_MINUTE);
+      const settleB = second.host.settle();
+      harness.advanceClock(6 * WEB_MINUTE);
+      const earlyReturn = await second.signal(WEB_ACTIVITY_BODY);
+      const earlyPage = await second.messages(freshPage.body.cursor);
+
+      harness.step({
+        title: 'C-02 冷却恢复：距上次欢迎 37 分钟 < 90 分钟，新实例的欢迎仍被持久化冷却扣下',
+        input: {
+          kind: 'presence-web-http-restart',
+          note: '新实例自己的策略没有旧欢迎记忆；扣下它的是从状态文件恢复的 session 冷却闸门',
+        },
+        model: { calls: 0 },
+        expected: {
+          settleState: 'away',
+          returnCode: 200,
+          pageKinds: '', pageCount: 0,
+        },
+        actual: {
+          settleState: settleB.state,
+          returnCode: earlyReturn.code,
+          pageKinds: webMessageKinds(earlyPage),
+          pageCount: earlyPage.body.messages.length,
+        },
+      });
+
+      /* ── 过冷却：先走出 away（settle 结算），再在冷却窗口之外回来 ── */
+      harness.advanceClock(31 * WEB_MINUTE);
+      second.host.settle();
+      harness.advanceClock(60 * WEB_MINUTE);
+      const lateReturn = await second.signal(WEB_ACTIVITY_BODY);
+      const latePage = await second.messages(earlyPage.body.cursor);
+      const lateWelcome = latePage.body.messages[0] ?? null;
+      const lateWelcomeAt = harness.now();
+      const stateAfterLate = readState(stateFile);
+
+      harness.step({
+        title: 'C-02 过冷却新事件：距上次欢迎 128 分钟 ≥ 90 分钟，away → 回来产生一条新的 welcome-back',
+        input: {
+          kind: 'presence-web-http-restart',
+          note: '冷却闸门按持久化时间戳放行，并把 cooldowns.welcome 更新为本次时刻',
+        },
+        model: { calls: 0 },
+        delivery: {
+          attempted: 1,
+          sent: 0,
+          receipts: ['queued'],
+          texts: lateWelcome ? [lateWelcome.text] : [],
+          channel: 'web-http-messages',
+        },
+        expected: {
+          returnCode: 200,
+          newKinds: 'welcome-back', newCount: 1,
+          idDiffers: true, cursorDiffers: true,
+          textNonEmpty: true,
+          cooldownWelcomeUpdated: true,
+        },
+        actual: {
+          returnCode: lateReturn.code,
+          newKinds: webMessageKinds(latePage),
+          newCount: latePage.body.messages.length,
+          idDiffers: (lateWelcome?.id ?? '') !== firstMessageId,
+          cursorDiffers: latePage.body.cursor !== firstCursor,
+          textNonEmpty: typeof lateWelcome?.text === 'string' && lateWelcome.text.length > 0,
+          cooldownWelcomeUpdated: stateAfterLate?.cooldowns?.welcome === lateWelcomeAt,
+        },
+      });
+
+      return {
+        modules: [
+          'presence/web-host.js',
+          'presence/web-http.js',
+          'presence/session.js',
+          'presence/persistence.js',
+        ],
+        limitation: 'web-presence-http-restart-loopback-offline',
+        note: '重启是同一状态文件上的第二个 host 实例 + 同一虚拟时钟，不是 OS 进程级重启；'
+          + 'HTTP 客户端只打 /presence/signal 与 /presence/messages；'
+          + '不证明真实浏览器/页面/T6 芙兰宿主验收。',
+        settings,
+        stateFileShared: true,
+      };
+    } finally {
+      await second.close();
+    }
+  } finally {
+    await first.close();
+  }
+}
+
 /* ══════════════════════ 场景表 ══════════════════════ */
 
 /**
- * 本 checkout 没有 Web presence 宿主路径。
+ * C 门当前没有 not-covered 项：C-01/C-02 的 Web presence 宿主路径
+ * （#96 web-host.js + #100 web-http.js）已合入公开 fork，场景见上方 runC01/runC02。
+ * 历史上的 `C_NOT_COVERED`（requires-web-presence-host）不再登记任何条目。
  */
-export const C_NOT_COVERED = Object.freeze([
-  Object.freeze({
-    id: 'C-01',
-    gate: 'group',
-    status: 'not-covered',
-    title: '未覆盖：C-01 Web presence 欢迎/休息',
-    reason: 'requires-web-presence-host',
-    requires: 'Web presence 宿主/API 路径（本 checkout 没有）',
-  }),
-  Object.freeze({
-    id: 'C-02',
-    gate: 'group',
-    status: 'not-covered',
-    title: '未覆盖：C-02 Web presence 重启恢复',
-    reason: 'requires-web-presence-restart',
-    requires: 'Web presence 状态文件与重启装配（本 checkout 没有；QQ presence 重启见 C-05）',
-  }),
-]);
+export const C_NOT_COVERED = Object.freeze([]);
 
 /** C 门可执行场景（顺序固定）。 */
 export const C_SCENARIOS = Object.freeze([
+  Object.freeze({
+    id: 'C-01',
+    aliases: ['presence-web-http'],
+    gate: 'group',
+    status: 'covered',
+    title: 'C-01 Web presence HTTP：欢迎/休息/冷却限流/内容盲禁止正文/禁用清空（临时回环 HTTP 客户端）',
+    run: runC01,
+  }),
+  Object.freeze({
+    id: 'C-02',
+    aliases: ['presence-web-restart'],
+    gate: 'group',
+    status: 'covered',
+    title: 'C-02 Web presence 重启：共享状态文件、冷却/会话恢复、旧欢迎不补发、过冷却可新事件',
+    run: runC02,
+  }),
   Object.freeze({
     id: 'C-03',
     aliases: ['presence-default-off'],

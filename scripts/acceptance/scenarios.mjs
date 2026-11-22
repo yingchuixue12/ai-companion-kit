@@ -8,11 +8,13 @@
  *                   index.js#main / tools/registry / tools/host-bridge /
  *                   media/*（含 voice-runtime）/ presence-qq-runtime.js），
  *                   外部世界一律用假 bot、脚本化假 brain、临时目录、虚拟时钟。
- *   not-covered  —— 依赖本 checkout 里**不存在**的东西（宿主集成、QQ/OneBot 集成、
- *                   Web presence 宿主路径），因此**没有**执行证据；不用纯桩断言冒充验收。
+ *   not-covered  —— 依赖本 checkout 里**不存在**的东西（宿主集成、QQ/OneBot 集成），
+ *                   因此**没有**执行证据；不用纯桩断言冒充验收。
  *
- * C 门离线 presence：C-03/C-04/C-05…C-09 在 presence-scenarios.mjs，全部用
- * 合成 OneBot + 虚拟时钟；C-01/C-02 缺 Web presence 宿主路径，保持 not-covered。
+ * C 门离线 presence（C-01…C-09）都在 presence-scenarios.mjs：
+ *   C-01/C-02 用真实 web-host.js + 真实 web-http.js 挂临时回环 HTTP server（#96/#100
+ *   已合入），HTTP 客户端只打 /presence/signal 与 /presence/messages；
+ *   C-03…C-09 用合成 OneBot + 虚拟时钟。C 门当前没有 not-covered 项。
  *
  * D/E 离线契约：D-01…D-04 复用 media/* 的 ASR/TTS 桩与 voice-runtime 公开入口，
  * D-05 复用 lib.js#createAttachmentHost 的附件元数据入口（只到 U2 前的离线契约），
@@ -51,7 +53,7 @@ import {
   createVoiceRuntime,
 } from '../../packages/companion/src/lib.js';
 
-import { C_NOT_COVERED, C_SCENARIOS } from './presence-scenarios.mjs';
+import { C_SCENARIOS } from './presence-scenarios.mjs';
 import { OWNER_PRIVATE_SCENARIOS } from './owner-private-scenarios.mjs';
 
 /** 合成会话键 / 对方 id：全部是占位值，不对应任何真实账号。 */
@@ -3217,7 +3219,7 @@ export const SCENARIOS = Object.freeze([
   { id: 'B-16', aliases: ['context-budget'], gate: 'b', status: 'covered', title: 'B-16 上下文预算：按 recent → memory → situation 丢弃', run: runB16 },
   { id: 'B-17', aliases: ['generation-delivery-commit'], gate: 'b', status: 'covered', title: 'B-17 生成 / 投递 / 记忆提交分离', run: runB17 },
   NOT_COVERED['B-18'],
-  ...C_NOT_COVERED,
+  // C-01/C-02 的 Web presence 宿主路径（#96/#100）已合入；C 门不再有 not-covered 项。
   ...C_SCENARIOS,
   { id: 'X-01', aliases: ['tool-confirmation'], gate: 'extra', status: 'covered', title: 'X-01（增补）工具确认一次性 / 高风险永不执行', run: runX01 },
   { id: 'X-02', aliases: ['reminder-store-integrity'], gate: 'extra', status: 'covered', title: 'X-02（增补）提醒快照 fail-closed，坏文件不被抹掉', run: runX02 },
