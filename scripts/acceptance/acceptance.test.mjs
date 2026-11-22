@@ -21,6 +21,8 @@
  *      0 次生成）；同一装配用一条明确提醒作正对照（真的新建并回复任务 ID）。
  *  14. B-08 消息与到期提醒同时发生：回复在途时提醒只 claim 入队不发送；放行后
  *      回复先发、提醒后发各一次并落终态；终态再派发不重发（只证明 CLI 离线层）。
+ *  15. D/E 离线契约：D-01…D-03（ASR/TTS 桩）与 E-01…E-04（fake tool）；
+ *      D-04/D-05/E-05 仍显式 not-covered，不用增补旁证冒充 D/E 验收。
  *
  * 全程离线：只用临时目录与内存桩，不联网、不调模型、不读写仓库 data/。
  */
@@ -438,20 +440,29 @@ test('场景表：B 门分母是 18，未覆盖 id 与 covered id 不重叠', ()
   );
   for (const id of missing) assert.ok(!covered.includes(id), id + ' 不该同时是 covered');
   // 增补场景只加证据，不改 B 门分母。
-  for (const extra of ['X-01', 'X-02', 'X-03', 'X-04', 'X-05', 'X-06']) {
+  for (const extra of [
+    'X-01', 'X-02', 'X-03', 'X-04', 'X-05', 'X-06',
+    'D-01', 'D-02', 'D-03', 'E-01', 'E-02', 'E-03', 'E-04',
+  ]) {
     assert.ok(!bGateIds().includes(extra), extra + ' 不该进 B 门分母');
     assert.ok(covered.includes(extra), extra + ' 应作为增补场景被执行');
   }
   assert.equal(
     listScenarios().filter((scenario) => scenario.gate === 'extra' && scenario.status === 'covered').length,
-    6,
+    13,
   );
-  // covered 总数 = 11 个 B 门 + 6 个增补；not-covered 仍是 7 个 B 门 + 3 个组。
-  assert.equal(covered.length, 17);
-  assert.equal(listScenarios().length, 27);
+  // covered 总数 = 11 个 B 门 + 13 个增补；not-covered 是 7 个 B 门 + 3 个 D/E + 1 个 C 组。
+  assert.equal(covered.length, 24);
+  assert.equal(listScenarios().length, 35);
   // 缺失的宿主 / QQ 集成路径在本 checkout 里确实不存在：用场景表登记证明，
   // 不断言任何私有目录名（公开 fork 不依赖私有宿主路径）。
   assert.equal(findScenario('B-03').status, 'not-covered');
+  for (const id of ['D-04', 'D-05', 'E-05']) {
+    const scenario = findScenario(id);
+    assert.equal(scenario.status, 'not-covered', id + ' 应保留为未覆盖');
+    assert.equal(scenario.run, undefined, id + ' 不能用桩冒充验收');
+    assert.ok(scenario.reason.length > 0);
+  }
 });
 
 test('场景表：每个 covered 场景都有可执行的 run，not-covered 只有说明', () => {
@@ -576,7 +587,7 @@ test('runner：默认执行整表，退出码 0，覆盖分母与未覆盖列表
   assert.equal(report.summary.passed, coveredScenarios().length);
   // summary.passed 包括增补场景，B 门通过数必须单独可读。
   assert.equal(report.summary.bGatePassed, 11);
-  assert.equal(report.summary.passed - report.summary.bGatePassed, 6);
+  assert.equal(report.summary.passed - report.summary.bGatePassed, 13);
   assert.equal(report.summary.coverageDenominator, 18);
   assert.equal(report.summary.completeBGate, false, 'completeBGate 必须保持 false');
   assert.equal(report.coverage.denominator, 18);
@@ -585,19 +596,22 @@ test('runner：默认执行整表，退出码 0，覆盖分母与未覆盖列表
     'B-01', 'B-02', 'B-06', 'B-07', 'B-08', 'B-09', 'B-10', 'B-11', 'B-13', 'B-16', 'B-17',
   ]);
   // 增补场景按执行顺序出现在 extraExecutedIds 里，且不进入 B 门的任何列表。
-  assert.deepEqual(report.coverage.extraExecutedIds, ['X-01', 'X-02', 'X-03', 'X-04', 'X-05', 'X-06']);
+  assert.deepEqual(report.coverage.extraExecutedIds, [
+    'X-01', 'X-02', 'X-03', 'X-04', 'X-05', 'X-06',
+    'D-01', 'D-02', 'D-03', 'E-01', 'E-02', 'E-03', 'E-04',
+  ]);
   for (const extra of report.coverage.extraExecutedIds) {
     assert.ok(!report.coverage.missingBIds.includes(extra), extra + ' 混进了 missingBIds');
     assert.ok(!report.coverage.notExecutedBIds.includes(extra), extra + ' 混进了 notExecutedBIds');
   }
   assert.deepEqual(report.coverage.notCoveredBIds, notCoveredBIds());
   assert.ok(report.coverage.missingBIds.includes('B-03'));
-  assert.ok(report.coverage.groupIds.includes('C-*'));
+  assert.deepEqual(report.coverage.groupIds, ['C-*']);
   assert.equal(report.summary.notCovered, report.summary.total - report.summary.executed);
-  // 27 项 = 18 个 B 门 + 6 个增补 + 3 个组。
-  assert.equal(report.summary.total, 27);
-  assert.equal(report.summary.executed, 17);
-  assert.equal(report.summary.notCovered, 10);
+  // 35 项 = 18 个 B 门 + 13 个增补 + 3 个 D/E 未覆盖 + 1 个 C 组。
+  assert.equal(report.summary.total, 35);
+  assert.equal(report.summary.executed, 24);
+  assert.equal(report.summary.notCovered, 11);
   // 生成时间来自虚拟时钟：必须显式标注来源，避免被当成真实墙钟。
   assert.equal(report.generatedAtSource, 'harness-virtual-clock');
   assert.equal(report.generatedAt, '2026-01-01T00:00:00.000Z');
@@ -1433,4 +1447,150 @@ test('runner：B-08 提醒不覆盖在途消息、消息不吞掉到期提醒，
   assert.deepEqual(b08.artifacts.tempFiles, [
     'b08/data/reminders.json', 'b08/memory/people.json', 'b08/memory/turns.jsonl',
   ]);
+});
+
+/* ═══════════════ 14. D/E 离线契约场景（D-01…D-03 / E-01…E-04） ═══════════════ */
+
+test('D-01：离线 ASR 桩返回转写/置信度/元数据，且没有 memory port 时不写长期记忆', async () => {
+  const harness = createHarness();
+  try {
+    const result = await runScenario('D-01', { harness });
+    assert.equal(result.status, 'pass');
+    assert.equal(result.steps.length, 1);
+    const step = result.steps[0];
+    assert.equal(step.actual.ok, true);
+    assert.equal(step.actual.text, '今天有点累');
+    assert.equal(step.actual.confidence, 0.92);
+    assert.equal(step.actual.provider, 'offline-asr-stub');
+    assert.equal(step.actual.mime, 'audio/ogg');
+    assert.equal(step.actual.eligible, true);
+    assert.equal(step.actual.written, false);
+    assert.equal(step.actual.reason, 'memory-port-missing');
+    assert.equal(step.actual.hasError, false);
+    assert.deepEqual(step.diff, []);
+  } finally {
+    harness.cleanup();
+  }
+});
+
+test('D-02：ASR 失败返回 asr-failed + ask-repeat，保留元数据', async () => {
+  const harness = createHarness();
+  try {
+    const result = await runScenario('D-02', { harness });
+    assert.equal(result.status, 'pass');
+    const step = result.steps[0];
+    assert.equal(step.actual.ok, false);
+    assert.equal(step.actual.code, 'asr-failed');
+    assert.equal(step.actual.action, 'ask-repeat');
+    assert.equal(step.actual.retryable, true);
+    assert.equal(step.actual.ref, 'synthetic://d02/voice-1');
+    assert.equal(step.actual.transcript, null);
+    assert.deepEqual(step.diff, []);
+  } finally {
+    harness.cleanup();
+  }
+});
+
+test('D-03：TTS 显式失败与超时都保留文字回退，不落音频', async () => {
+  const harness = createHarness();
+  try {
+    const result = await runScenario('D-03', { harness });
+    assert.equal(result.status, 'pass');
+    assert.equal(result.steps.length, 2);
+    assert.deepEqual(result.steps.map((step) => step.actual.code), ['tts-failed', 'timeout']);
+    for (const step of result.steps) {
+      assert.equal(step.actual.ok, false);
+      assert.equal(step.actual.fallbackKept, true);
+      assert.equal(step.actual.fallbackChars, 6);
+      assert.equal(step.actual.audioRef, null);
+      assert.equal(step.actual.stored, 0);
+      assert.deepEqual(step.diff, []);
+    }
+  } finally {
+    harness.cleanup();
+  }
+});
+
+test('E-01：未知工具返回 unknown-tool，不执行也不落审计', async () => {
+  const harness = createHarness();
+  try {
+    const result = await runScenario('E-01', { harness });
+    assert.equal(result.status, 'pass');
+    const step = result.steps[0];
+    assert.equal(step.actual.ok, false);
+    assert.equal(step.actual.code, 'unknown-tool');
+    assert.equal(step.actual.auditEntries, 0);
+    assert.deepEqual(step.diff, []);
+  } finally {
+    harness.cleanup();
+  }
+});
+
+test('E-02：需确认工具拒绝后不重试，handler 不执行', async () => {
+  const harness = createHarness();
+  try {
+    const result = await runScenario('E-02', { harness });
+    assert.equal(result.status, 'pass');
+    const step = result.steps[0];
+    assert.equal(step.actual.withoutId, 'confirmation-required');
+    assert.equal(step.actual.pending, 'confirmation-pending');
+    assert.equal(step.actual.denyStatus, 'denied');
+    assert.equal(step.actual.denied, 'confirmation-denied');
+    assert.equal(step.actual.retry, 'confirmation-denied');
+    assert.equal(step.actual.handlerRuns, 0);
+    assert.equal(step.actual.requestAudit, 1);
+    assert.equal(step.actual.decisionAudit, 1);
+    assert.equal(step.actual.deniedAudit, 2);
+    assert.deepEqual(step.diff, []);
+  } finally {
+    harness.cleanup();
+  }
+});
+
+test('E-03：工具超时返回 timeout 并留下 timeout 审计', async () => {
+  const harness = createHarness();
+  try {
+    const result = await runScenario('E-03', { harness });
+    assert.equal(result.status, 'pass');
+    const step = result.steps[0];
+    assert.equal(step.actual.ok, false);
+    assert.equal(step.actual.code, 'timeout');
+    assert.equal(step.actual.auditLastCode, 'timeout');
+    assert.equal(step.actual.auditLastEvent, 'execute');
+    assert.equal(step.actual.elapsedAtLeast15, true);
+    assert.deepEqual(step.diff, []);
+  } finally {
+    harness.cleanup();
+  }
+});
+
+test('E-04：高风险工具默认 risk-not-allowed，handler 不执行', async () => {
+  const harness = createHarness();
+  try {
+    const result = await runScenario('E-04', { harness });
+    assert.equal(result.status, 'pass');
+    const step = result.steps[0];
+    assert.equal(step.actual.ok, false);
+    assert.equal(step.actual.code, 'risk-not-allowed');
+    assert.equal(step.actual.handlerRuns, 0);
+    assert.equal(step.actual.auditLastCode, 'risk-not-allowed');
+    assert.equal(step.actual.auditConfirmation, 'not-required');
+    assert.deepEqual(step.diff, []);
+  } finally {
+    harness.cleanup();
+  }
+});
+
+test('D/E 未覆盖项仍明确保留：D-04/D-05/E-05 没有 run', () => {
+  for (const id of ['D-04', 'D-05', 'E-05']) {
+    const scenario = findScenario(id);
+    assert.equal(scenario.status, 'not-covered', id + ' 应保留为未覆盖');
+    assert.equal(scenario.run, undefined, id + ' 不能用桩冒充验收');
+    assert.ok(scenario.reason.length > 0);
+  }
+});
+
+test('D/E 增补不改变 B 门：bGateIds 18，notCoveredBIds 7', () => {
+  assert.equal(bGateIds().length, 18);
+  assert.equal(notCoveredBIds().length, 7);
 });

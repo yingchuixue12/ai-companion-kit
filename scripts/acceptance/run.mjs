@@ -187,7 +187,7 @@ export function buildReport({
     reasons.push(permanentGaps.length + ' 个完全没有离线可执行证据（' + permanentGaps.join(' ') + '）');
   }
   if (notExecuted.length > 0) reasons.push('另有 ' + notExecuted.length + ' 个本次未执行');
-  if (notCovered.some((item) => item.gate === 'group')) reasons.push('C/D/E 组未覆盖');
+  if (notCovered.some((item) => item.gate === 'group')) reasons.push('C 组未覆盖');
   const gateReason = completeBGate
     ? 'B 门 ' + denominators.length + ' 项都有可执行证据，且本次全部通过。'
     : 'B 门 ' + denominators.length + ' 项尚未全部有可执行证据：' + reasons.join('；') + '。';
