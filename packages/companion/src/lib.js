@@ -63,3 +63,8 @@ export {
   PRESENCE_WEB_STATE_TTL_MS,
   PRESENCE_WEB_STATUSES,
 } from './presence/web-host.js';
+export {
+  createAttachmentHost,
+  inspectAttachmentMetadata,
+  ATTACHMENT_HOST_VERSION,
+} from './media/attachment-host.js';
