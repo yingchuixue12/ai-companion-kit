@@ -31,6 +31,7 @@ import { OneBot } from './transport-onebot.js';
 import { createPrivateTurnReplay } from './private-turn-replay.js';
 import { createReminderRuntime } from './reminder-runtime.js';
 import { createReminderCommands } from './reminder-commands.js';
+import { createPresenceQQHost } from './presence-qq-runtime.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -61,6 +62,25 @@ export function loadConfig(explicitPath, argv = process.argv) {
     names: cfg.names || [],
     keywords: cfg.keywords || [],
     ownerIds: (cfg.ownerIds || []).map(String),
+
+    // QQ 在场主动消息（C-P2 默认关）：只有显式 enabled 且 owner 在 ownerIds 白名单里
+    // 才会装配发送；未给出的数值字段交给各模块自己的安全默认值。
+    presenceQQ: {
+      enabled: cfg.presenceQQ?.enabled === true,
+      ownerId: cfg.presenceQQ?.ownerId === undefined || cfg.presenceQQ?.ownerId === null
+        ? ''
+        : String(cfg.presenceQQ.ownerId).trim(),
+      idleMs: cfg.presenceQQ?.idleMs,
+      awayMs: cfg.presenceQQ?.awayMs,
+      returnAfterMs: cfg.presenceQQ?.returnAfterMs,
+      workAfterMs: cfg.presenceQQ?.workAfterMs,
+      cooldownMs: cfg.presenceQQ?.cooldownMs,
+      minGapMs: cfg.presenceQQ?.minGapMs,
+      maxPerDay: cfg.presenceQQ?.maxPerDay,
+      quietHours: cfg.presenceQQ?.quietHours ?? null,
+      intentTtlMs: cfg.presenceQQ?.intentTtlMs,
+      maxPending: cfg.presenceQQ?.maxPending,
+    },
 
     wake: {
       probability: cfg.wake?.probability ?? 0.05,
@@ -249,9 +269,17 @@ export async function main({ createBot, proc: injectedProc, process: injectedPro
   /** @type {Map<string, NodeJS.Timeout>} 每个群会话的合并定时器 */
   const pending = new Map();
 
+  // Presence 装配在 bot 之后（发送要用 bot），但消息可能先到，所以先留一个句柄。
+  /** @type {ReturnType<typeof createPresenceQQHost>|null} */
+  let presenceHost = null;
+
   const bot = buildBot({
     ...cfg.onebot,
     onMessage: (msg) => {
+      // 只有选定 owner 的私聊会动 presence；群聊/非 owner 由 host 自己忽略。
+      // 先于唤醒判定，避免「静音」分支漏掉用户活动刷新。
+      presenceHost?.onIncomingMessage(msg);
+
       // 第一次见到这个会话 → 给个默认策略
       if (!waker.configs.has(msg.key)) {
         waker.setConfig(msg.key, msg.isGroup
@@ -293,6 +321,24 @@ export async function main({ createBot, proc: injectedProc, process: injectedPro
 
   deps.bot = bot;
 
+  // QQ 在场（默认关）：配置闸门全过才建 adapter；--dry-run 不建 adapter、不落盘。
+  // 装配即显式恢复（不重放旧事件、不补发旧欢迎）；读取失败则 fail-closed 不发送。
+  presenceHost = createPresenceQQHost({
+    cfg,
+    bot,
+    human,
+    now: () => Date.now(),
+    journal: (event) => {
+      // 只按固定事件类型报告，不转发任何正文 / 账号 / 异常 message。
+      if (event?.type === 'presence-persist-failed') console.error('[在场] 状态落盘失败，本次不发送');
+    },
+  });
+  if (cfg.presenceQQ.enabled) {
+    console.log('  在场QQ    ' + (presenceHost.enabled
+      ? presenceHost.ownerId + '（已启用）'
+      : '未启用（' + presenceHost.status + '）'));
+  }
+
   // 宿主定时运转：显式 --reminders 且非干跑才启动。没有有效白名单时
   // runtime 自己不会排定时器，也不碰 bot；干跑连 runtime 都不建。
   /** @type {ReturnType<typeof createReminderRuntime>|null} */
@@ -310,15 +356,16 @@ export async function main({ createBot, proc: injectedProc, process: injectedPro
 
   proc.on('unhandledRejection', (e) => reportError(e, '未处理'));
   proc.on('SIGINT', () => {
-    // 先停调度，再按原来的方式退出。
+    // 先停调度与在场（落盘会话），再按原来的方式退出。
     reminders?.stop();
+    presenceHost?.stop();
     console.log('\n再见。');
     if (typeof proc.exit === 'function') proc.exit(0);
     else process.exit(0);
   });
 
   console.log('在跑了。Ctrl+C 退出。\n');
-  return { bot, reminders };
+  return { bot, reminders, presence: presenceHost };
 }
 
 /**

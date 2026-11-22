@@ -53,5 +53,20 @@
   "dataDir": "data",
   "// 8": "=== 日记（她自己写）===",
   "diaryDir": "data/diary",
-  "diaryMaxChars": 2000
+  "diaryMaxChars": 2000,
+  "// 9": "=== QQ 在场主动消息（默认关；B 门槛通过前不要打开）===",
+  "presenceQQ": {
+    "enabled": false,
+    "ownerId": "",
+    "idleMs": 300000,
+    "awayMs": 1800000,
+    "returnAfterMs": 300000,
+    "workAfterMs": 3000000,
+    "cooldownMs": 5400000,
+    "minGapMs": 900000,
+    "maxPerDay": 2,
+    "quietHours": null,
+    "intentTtlMs": 1800000,
+    "maxPending": 8
+  }
 }
