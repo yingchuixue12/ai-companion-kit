@@ -19,7 +19,8 @@
  *  11. Windows：临时目录/仓库路径大小写不同也按同一路径判定（Git Bash / 小写盘符）；
  *  12. 增补场景：X-03 的工具审计边界（正文/凭据不进证据）、X-04 的离线媒体证据
  *      （临时音频删干净、低置信度不写记忆、TTS 失败保留文字）、X-05 的离线 QQ presence
- *      证据（只发唯一 owner、状态文件白名单无正文、重启不补发不重发）。
+ *      证据（只发唯一 owner、状态文件白名单无正文、重启不补发不重发）、
+ *      X-08 的公开 CLI 普通私聊记忆引用旁证（本用户事实进提示词、别人的不进、只发本会话一次）。
  *  13. B-07 模糊提醒：走 CLI 的私聊装配层，模糊只回澄清（零任务、无已创建回执、
  *      0 次生成）；同一装配用一条明确提醒作正对照（真的新建并回复任务 ID）。
  *  14. B-08 消息与到期提醒同时发生：回复在途时提醒只 claim 入队不发送；放行后
@@ -923,7 +924,7 @@ test('场景表：B 门分母是 18，未覆盖 id 与 covered id 不重叠', ()
   for (const id of missing) assert.ok(!covered.includes(id), id + ' 不该同时是 covered');
   // 增补场景只加证据，不改 B 门分母。
   for (const extra of [
-    'X-01', 'X-02', 'X-03', 'X-04', 'X-05', 'X-06', 'X-07',
+    'X-01', 'X-02', 'X-03', 'X-04', 'X-05', 'X-06', 'X-07', 'X-08',
     'D-01', 'D-02', 'D-03', 'D-04', 'D-05', 'E-01', 'E-02', 'E-03', 'E-04', 'E-05',
   ]) {
     assert.ok(!bGateIds().includes(extra), extra + ' 不该进 B 门分母');
@@ -938,12 +939,12 @@ test('场景表：B 门分母是 18，未覆盖 id 与 covered id 不重叠', ()
   assert.deepEqual(notCoveredCIds(), []);
   assert.equal(
     listScenarios().filter((scenario) => scenario.gate === 'extra' && scenario.status === 'covered').length,
-    17,
+    18,
   );
-  // covered 总数 = 11 个 B 门 + 8 个 C 门 + 17 个增补（含 X-07 旁证与 D-05）；
+  // covered 总数 = 11 个 B 门 + 8 个 C 门 + 18 个增补（含 X-07/X-08 旁证与 D-05）；
   // not-covered 只剩 7 个 B 门缺口。
-  assert.equal(covered.length, 36);
-  assert.equal(listScenarios().length, 43);
+  assert.equal(covered.length, 37);
+  assert.equal(listScenarios().length, 44);
   // 缺失的宿主 / QQ 集成路径在本 checkout 里确实不存在：用场景表登记证明，
   // 不断言任何私有目录名（公开 fork 不依赖私有宿主路径）。
   assert.equal(findScenario('B-03').status, 'not-covered');
@@ -1078,7 +1079,7 @@ test('runner：默认执行整表，退出码 0，覆盖分母与未覆盖列表
   // summary.passed 包括 C 与增补场景，B 门通过数必须单独可读。
   assert.equal(report.summary.bGatePassed, 11);
   assert.equal(report.summary.cGatePassed, 8);
-  assert.equal(report.summary.passed - report.summary.bGatePassed, 25);
+  assert.equal(report.summary.passed - report.summary.bGatePassed, 26);
   assert.equal(report.summary.coverageDenominator, 18);
   assert.equal(report.summary.cGateCoverageDenominator, 8);
   assert.equal(report.summary.completeBGate, false, 'completeBGate 必须保持 false');
@@ -1091,7 +1092,7 @@ test('runner：默认执行整表，退出码 0，覆盖分母与未覆盖列表
   // C 与增补场景按执行顺序出现在 extraExecutedIds 里，且不进入 B 门的任何列表。
   assert.deepEqual(report.coverage.extraExecutedIds, [
     'C-01', 'C-02', 'C-03', 'C-04', 'C-05', 'C-07', 'C-08', 'C-09',
-    'X-01', 'X-02', 'X-03', 'X-04', 'X-05', 'X-06', 'X-07',
+    'X-01', 'X-02', 'X-03', 'X-04', 'X-05', 'X-06', 'X-07', 'X-08',
     'D-01', 'D-02', 'D-03', 'D-04', 'D-05', 'E-01', 'E-02', 'E-03', 'E-04', 'E-05',
   ]);
   for (const extra of report.coverage.extraExecutedIds) {
@@ -1108,9 +1109,9 @@ test('runner：默认执行整表，退出码 0，覆盖分母与未覆盖列表
   assert.ok(report.coverage.missingBIds.includes('B-03'));
   assert.deepEqual(report.coverage.groupIds, []);
   assert.equal(report.summary.notCovered, report.summary.total - report.summary.executed);
-  // 43 项 = 18 个 B 门 + 8 个 C 门 + 17 个增补；not-covered 只剩 7 个 B 门缺口。
-  assert.equal(report.summary.total, 43);
-  assert.equal(report.summary.executed, 36);
+  // 44 项 = 18 个 B 门 + 8 个 C 门 + 18 个增补；not-covered 只剩 7 个 B 门缺口。
+  assert.equal(report.summary.total, 44);
+  assert.equal(report.summary.executed, 37);
   assert.equal(report.summary.notCovered, 7);
   // 生成时间来自虚拟时钟：必须显式标注来源，避免被当成真实墙钟。
   assert.equal(report.generatedAtSource, 'harness-virtual-clock');
@@ -1898,6 +1899,75 @@ test('X-07：owner-private 通用入口旁证，B-14/B-18 仍保持 not-covered'
       assert.ok(gap.artifacts.proofRequired.length > 0, id + ' 缺少 proofRequired');
       assert.deepEqual(gap.steps, []);
     }
+  } finally {
+    capture.restore();
+    harness.cleanup();
+  }
+});
+
+/* ═══════════ 11c. X-08 公开 CLI 普通私聊记忆引用旁证 ═══════════ */
+
+test('X-08：公开 CLI 普通私聊的记忆引用旁证，B-05 仍保持 not-covered', async () => {
+  const harness = createHarness();
+  const capture = captureConsole();
+  const originalFetch = globalThis.fetch;
+  try {
+    const x08 = await runScenario('X-08', { harness });
+    assert.equal(x08.status, 'pass', JSON.stringify(x08.diagnostics));
+    assert.equal(x08.gate, 'extra');
+    assert.equal(x08.steps.length, 1);
+    assert.equal(x08.steps[0].diff.length, 0);
+
+    const actual = x08.steps[0].actual;
+    // 真实 main() 的普通私聊：一次模型请求、一次发送、一轮落账。
+    assert.equal(actual.modelCalls, 1);
+    assert.equal(actual.modelUrlSynthetic, true);
+    assert.equal(actual.systemPresent, true);
+    assert.equal(actual.userTextInRequest, true);
+    assert.equal(actual.sendCalls, 1);
+    assert.equal(actual.sendToOwnerConversation, true);
+    assert.equal(actual.sendTextMatched, true);
+    assert.equal(actual.typingCalls, 0);
+    assert.equal(actual.turns, 1);
+    assert.equal(actual.ownerTurns, 1);
+    assert.equal(actual.otherTurns, 0);
+    assert.equal(actual.turnWhereOwner, true);
+    assert.equal(actual.turnReplyMatched, true);
+    assert.equal(actual.ownerFactStillSaved, true);
+    assert.equal(actual.otherFactIntact, true);
+
+    // B-05 的核心边界：本用户事实进提示词，另一用户事实不进。
+    assert.equal(actual.ownerFactInPrompt, true);
+    assert.equal(actual.otherFactInPrompt, false);
+
+    // 证据只留布尔和计数，合成事实 / 回复正文都不进 step。
+    const evidence = JSON.stringify(x08.steps);
+    assert.equal(evidence.includes('图书馆'), false, '合成事实正文进了证据');
+    assert.equal(evidence.includes('早点休息'), false, '合成回复正文进了证据');
+
+    // 旁证边界写死在 artifacts：不能把 X-08 读成 B-05 或 T9 通过。
+    assert.equal(x08.artifacts.limitation, 'public-cli-synthetic-model-and-onebot-memory-reference');
+    assert.deepEqual(x08.artifacts.corroborates, ['B-05']);
+    assert.ok(x08.artifacts.proofRequired.length >= 3, '缺少仍需证据清单');
+    assert.equal(x08.artifacts.boundary.realQQ, false);
+    assert.equal(x08.artifacts.boundary.flandreHost, false);
+    assert.equal(x08.artifacts.boundary.realModel, false);
+    assert.equal(x08.artifacts.boundary.syntheticOneBot, true);
+    assert.equal(x08.artifacts.boundary.syntheticModelFetch, true);
+
+    // 临时全局替身必须恢复，不能泄漏给其它测试。
+    assert.equal(globalThis.fetch, originalFetch, '全局 fetch 未恢复');
+
+    // B-05 保持 not-covered；X-08 只是 corroboratedBy，不改变分母。
+    const b05 = findScenario('B-05');
+    assert.equal(b05.status, 'not-covered', 'B-05 不能被 X-08 旁证改成 covered');
+    const gap = await runScenario('B-05', { harness });
+    assert.equal(gap.status, 'not-covered');
+    assert.deepEqual(gap.artifacts.corroboratedBy, ['X-08']);
+    assert.ok(gap.artifacts.proofRequired.length > 0, 'B-05 缺少 proofRequired');
+    assert.deepEqual(gap.steps, []);
+    assert.equal(bGateIds().length, 18);
+    assert.ok(notCoveredBIds().includes('B-05'));
   } finally {
     capture.restore();
     harness.cleanup();
