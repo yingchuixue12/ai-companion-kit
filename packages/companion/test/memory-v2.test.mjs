@@ -363,14 +363,31 @@ test('two real child processes append concurrently without losing or corrupting 
     'process.exitCode = 0;',
   ].join('\n'), 'utf8');
 
+  // 子进程 stderr 有界捕获：CI 失败时带出真实退出原因，正常路径不改变等待/断言语义。
+  const STDERR_LIMIT = 4096;
   const run = (workerId) => new Promise((resolve, reject) => {
-    const child = spawn(process.execPath, [workerPath, dir, workerId, '10'], { stdio: 'ignore' });
+    const child = spawn(process.execPath, [workerPath, dir, workerId, '10'], { stdio: ['ignore', 'ignore', 'pipe'] });
+    let stderr = '';
+    let truncated = false;
+    child.stderr.setEncoding('utf8');
+    child.stderr.on('data', (chunk) => {
+      const room = STDERR_LIMIT - stderr.length;
+      truncated ||= chunk.length > room;
+      stderr += chunk.slice(0, room);
+    });
     child.on('error', reject);
-    child.on('exit', (code) => resolve(code));
+    // close 在 exit 且 stdio 排空后触发，确保失败现场不被截断；仍然等两个子进程都结束。
+    child.on('close', (code, signal) => resolve({
+      code,
+      signal,
+      stderr: truncated ? stderr + '…[truncated]' : stderr,
+    }));
   });
-  const [codeA, codeB] = await Promise.all([run('A'), run('B')]);
-  assert.equal(codeA, 0);
-  assert.equal(codeB, 0);
+  const [workerA, workerB] = await Promise.all([run('A'), run('B')]);
+  const failureDetail = (workerId, result) =>
+    `worker ${workerId}: exit=${result.code} signal=${result.signal} stderr=${JSON.stringify(result.stderr)}`;
+  assert.equal(workerA.code, 0, failureDetail('A', workerA));
+  assert.equal(workerB.code, 0, failureDetail('B', workerB));
 
   const snapshot = store.read();
   assert.equal(snapshot.ok, true);
