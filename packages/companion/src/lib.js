@@ -47,3 +47,4 @@ export {
   VOICE_DECISION,
   VOICE_RUNTIME_ERROR,
 } from './media/voice-runtime.js';
+export { createToolHostBridge, formatToolHostOutcome } from './tools/host-bridge.js';
