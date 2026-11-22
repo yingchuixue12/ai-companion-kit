@@ -16,6 +16,9 @@
  *   node src/index.js --config ./config.json --dry-run   只打印，不真发
  *   node src/index.js --check                            只检查角色卡
  *   node src/index.js --config ./config.json --reminders 开启提醒定时派发（默认关）
+ *   node src/index.js --config ./config.json --owner-private
+ *       主人私聊准入：配置必须有有效 ownerIds，且只放行白名单里的私聊；
+ *       群聊 / 非主人 / 缺失或矛盾的会话标识在入口拒绝，不进入后续任何一层。
  */
 import fs from 'node:fs';
 import path from 'node:path';
@@ -33,6 +36,11 @@ import { createReminderRuntime } from './reminder-runtime.js';
 import { createReminderCommands } from './reminder-commands.js';
 import { createPresenceQQHost } from './presence-qq-runtime.js';
 import {
+  OWNER_PRIVATE_CONFIG_ERROR,
+  createOwnerPrivateGate,
+  loadOwnerPrivateConfig,
+} from './owner-private.js';
+import {
   createEntryMemoryRetriever,
   normalizeRetrievalConfig,
   retrieveMemoryForTurn,
@@ -46,6 +54,20 @@ export function loadConfig(explicitPath, argv = process.argv) {
   let cfg = {};
   try { cfg = JSON.parse(fs.readFileSync(file, 'utf8')); }
   catch { console.error('⚠️ 读不到 ' + file + '，用默认值（复制 config.example.json 改名即可）'); }
+  return normalizeConfig(cfg, file, argv);
+}
+
+/**
+ * 把已经读到的 JSON 值归一化成运行配置。
+ *
+ * 旧入口 `loadConfig()` 仍然保留「读不到就用默认值」的宽松行为；`--owner-private`
+ * 在调用这里之前会先做严格闸门，失败时不会走到 Memory / OneBot 装配。
+ *
+ * @param {any} cfg
+ * @param {string} file
+ * @param {string[]} [argv]
+ */
+export function normalizeConfig(cfg, file, argv = process.argv) {
   const dir = path.dirname(path.resolve(file));
   const rel = (p, def) => (p ? path.resolve(dir, p) : path.join(dir, def));
 
@@ -270,7 +292,35 @@ export async function main({ createBot, proc: injectedProc, process: injectedPro
   const buildBot = typeof createBot === 'function' ? createBot : (options) => new OneBot(options);
 
   const cfgIdx = argv.indexOf('--config');
-  const cfg = loadConfig(cfgIdx >= 0 ? argv[cfgIdx + 1] : null, argv);
+  const configPath = cfgIdx >= 0 ? argv[cfgIdx + 1] : null;
+  const ownerPrivateRequested = argv.includes('--owner-private');
+
+  // `--owner-private` 是严格模式：先过配置闸门，再碰 Memory / OneBot。
+  // 失败时只打固定文案，不回显配置、路径或解析异常；返回 ok:false 让 CLI 非零退出。
+  let cfg;
+  let ownerPrivate = null;
+  if (ownerPrivateRequested) {
+    const loaded = loadOwnerPrivateConfig(configPath);
+    if (!loaded.ok) {
+      console.error('[owner-private] ' + OWNER_PRIVATE_CONFIG_ERROR);
+      return {
+        ok: false,
+        bot: null,
+        reminders: null,
+        presence: null,
+        ownerPrivate: { enabled: true, ok: false, code: loaded.code },
+      };
+    }
+    cfg = normalizeConfig(loaded.config, loaded.file, argv);
+    // 用严格闸门归一化过的白名单，避免宽松路径的 String() 形状混进来。
+    cfg.ownerIds = loaded.ownerIds;
+    ownerPrivate = { enabled: true, ok: true, ownerIds: [...loaded.ownerIds] };
+  } else {
+    cfg = loadConfig(configPath, argv);
+  }
+
+  // 入口准入器在装配任何下游之前就绪；没有 flag 时为 null，旧行为不变。
+  const ownerGate = ownerPrivate ? createOwnerPrivateGate({ ownerIds: cfg.ownerIds }) : null;
 
   console.log('════════ companion ════════');
   console.log('  模型      ' + cfg.model + ' @ ' + cfg.baseUrl);
@@ -284,6 +334,7 @@ export async function main({ createBot, proc: injectedProc, process: injectedPro
   console.log('  记忆检索  ' + (cfg.memory.retrieval.enabled
     ? cfg.memory.retrieval.mode + '（上限 ' + cfg.memory.retrieval.maxChars + ' 字）'
     : '关'));
+  if (ownerGate) console.log('  准入      owner-private（仅白名单私聊）');
   console.log('');
 
   const memory = new Memory({ dir: cfg.dataDir });
@@ -331,6 +382,16 @@ export async function main({ createBot, proc: injectedProc, process: injectedPro
   const bot = buildBot({
     ...cfg.onebot,
     onMessage: (msg) => {
+      // --owner-private：入口第一道闸。被拒消息不进入 presence / waker /
+      // 模型 / 记忆 / 任务 / 发送；日志只留固定原因码，不写正文或账号。
+      if (ownerGate) {
+        const admission = ownerGate.admit(msg);
+        if (!admission.ok) {
+          console.error('[owner-private] 已拒绝：' + admission.reason);
+          return;
+        }
+      }
+
       // 只有选定 owner 的私聊会动 presence；群聊/非 owner 由 host 自己忽略。
       // 先于唤醒判定，避免「静音」分支漏掉用户活动刷新。
       presenceHost?.onIncomingMessage(msg);
@@ -420,7 +481,7 @@ export async function main({ createBot, proc: injectedProc, process: injectedPro
   });
 
   console.log('在跑了。Ctrl+C 退出。\n');
-  return { bot, reminders, presence: presenceHost };
+  return { ok: true, bot, reminders, presence: presenceHost, ownerPrivate };
 }
 
 /**
@@ -478,5 +539,10 @@ export async function handleTurn({ bot, brain, human, memory, waker }, items, cf
 
 // 直接跑才启动；被 import 时不启动
 if (process.argv[1] && path.resolve(process.argv[1]) === path.resolve(fileURLToPath(import.meta.url))) {
-  main().catch((e) => { reportError(e, '启动失败'); process.exit(1); });
+  main()
+    .then((result) => {
+      // 配置闸门失败不抛异常（避免把配置/路径带进错误报告），用退出码表达。
+      if (result?.ok === false) process.exit(1);
+    })
+    .catch((e) => { reportError(e, '启动失败'); process.exit(1); });
 }
