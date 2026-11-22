@@ -17,6 +17,8 @@
  *   - 临时目录所有权：harness 永远自己在调用者给的（经验证的专用）父目录下 mkdtemp
  *     一个自己的目录，cleanup 也只删这一个。系统临时根本身、仓库、越界实路径
  *     （软链接 / 联接点指出去）都拒绝；调用者父目录里的东西一概不碰。
+ *   - 删除前核对**目录身份**：创建时锁定真实路径 + dev/ino + 写进目录的所有权标记，
+ *     清理时三者都要对得上。父目录被改指、或同名目录被替换，一律拒绝删除。
  *   - 不调用真实模型：本 checkout 的 `brain.js` 直接调用全局 `fetch`，没有注入点，
  *     所以模型侧一律用脚本化替身；相关 step 的 `model.transport` 记
  *     `synthetic-scripted`，报告里同时给 `model-transport-synthetic` 诊断码。
@@ -28,6 +30,7 @@
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { randomUUID } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 
 import { Memory } from '../../packages/companion/src/memory.js';
@@ -49,6 +52,12 @@ export const DEFAULT_SEED = 20260101;
 
 /** 临时目录名前缀。 */
 const TEMP_PREFIX = 'ai-companion-acceptance-';
+
+/**
+ * 所有权标记文件名：创建时写进自建临时根，内容就是本次运行的随机 token。
+ * 它是框架自己的账本，不参与场景证据（tempFiles 会跳过它）。
+ */
+export const TEMP_OWNER_MARKER = '.harness-owner';
 
 /** 错误码白名单：只允许这类形状的 code 出现在诊断里。 */
 const SAFE_CODE = /^[A-Za-z][A-Za-z0-9:_-]{0,63}$/u;
@@ -231,6 +240,88 @@ export function isOwnedHarnessTempRoot(dir) {
   const real = resolveRealPath(resolved);
   if (real.path === null) return false;
   return classifyTempParent(real.path, { tmpRoot: realTmpRoot(), repoRoot: realRepoRoot() }).ok;
+}
+
+/**
+ * 目录身份：创建时锁定，删除前复核。
+ *
+ *   - `realPath` 创建时的真实路径——父目录（联接点 / 软链接）被改指、目录被搬走都会变；
+ *   - `dev` / `ino` 文件系统标识（Windows 本地 NTFS 与指向 NTFS 的 UNC 上是
+ *     卷序列号 + 文件索引，可用 BigInt 拿到；不报告 inode 的文件系统（部分 FAT / SMB）
+ *     会是 `'0'`，这时只靠 realPath + token）；
+ *   - `token` 本次运行写进目录的所有权标记——不依赖任何文件系统能力，兜底用。
+ *
+ * 三者不一致就说明"这个路径上的目录已经不是我们建的那个"。
+ * @param {string} dir
+ * @param {string} token
+ * @returns {{realPath: ?string, dev: ?string, ino: ?string, token: string}}
+ */
+function captureDirIdentity(dir, token) {
+  const real = resolveRealPath(dir);
+  const stats = fs.lstatSync(dir, { bigint: true, throwIfNoEntry: false });
+  return Object.freeze({
+    realPath: real.path,
+    dev: stats === undefined ? null : String(stats.dev),
+    ino: stats === undefined ? null : String(stats.ino),
+    token,
+  });
+}
+
+/** 两条真实路径是否同一条（Windows 大小写不敏感）。 */
+function isSameRealPath(left, right) {
+  if (typeof left !== 'string' || typeof right !== 'string') return false;
+  return normalizeForCompare(left, CASE_INSENSITIVE_FS)
+    === normalizeForCompare(right, CASE_INSENSITIVE_FS);
+}
+
+/** 写所有权标记（自建目录里，内容就是 token）。 */
+function writeOwnerMarker(dir, token) {
+  fs.writeFileSync(path.join(dir, TEMP_OWNER_MARKER), token + '\n', 'utf8');
+}
+
+/** 读所有权标记；读不到给 null（fail closed，不猜）。 */
+function readOwnerToken(dir) {
+  try {
+    return fs.readFileSync(path.join(dir, TEMP_OWNER_MARKER), 'utf8').trim();
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * 这个目录是否**仍然是本 harness 创建的那一个**（而不只是"路径还在临时区里"）。
+ *
+ * 校验顺序：路径守卫 → 真实路径与创建时一致 → 目录对象标识一致 → 所有权标记一致。
+ * 任何一条不成立都返回 false，调用方据此拒绝删除。
+ *
+ * 已知边界：如果替换者把所有权标记**连同目录内容一起照抄**，而底层文件系统又不报告
+ * inode（`ino === '0'`），此时无法区分——这种情形下 realPath 仍是唯一线索。
+ * @param {string} dir
+ * @param {{realPath: ?string, dev: ?string, ino: ?string, token: string}} identity
+ * @returns {boolean}
+ */
+export function isSameHarnessTempRoot(dir, identity) {
+  if (!identity || typeof identity !== 'object') return false;
+  if (typeof identity.token !== 'string' || identity.token === '') return false;
+  if (!isOwnedHarnessTempRoot(dir)) return false;
+
+  const resolved = path.resolve(String(dir));
+  const real = resolveRealPath(resolved);
+  if (real.path === null) return false;
+
+  // ① 真实路径必须还是创建时那一条：父目录被改指 / 目录被搬走 → 这里就不同。
+  if (!isSameRealPath(real.path, identity.realPath)) return false;
+
+  // ② 目录对象必须还是同一个：同名替换（删掉重建）会换掉 inode。
+  const stats = fs.lstatSync(resolved, { bigint: true, throwIfNoEntry: false });
+  if (stats === undefined || !stats.isDirectory()) return false;
+  const inoKnown = typeof identity.ino === 'string' && identity.ino !== '0' && identity.ino !== 'null';
+  if (inoKnown && (String(stats.ino) !== identity.ino || String(stats.dev) !== identity.dev)) {
+    return false;
+  }
+
+  // ③ 创建时写进去的所有权标记必须还在且一致（ino 不可用时这条兜底）。
+  return readOwnerToken(resolved) === identity.token;
 }
 
 /* ───────────────────────── 小工具 ───────────────────────── */
@@ -463,6 +554,13 @@ export function createHarness(options = {}) {
     : assertSafeTempParent(tempDir);
   const tempBase = injectedParent ?? path.resolve(os.tmpdir());
   const root = fs.mkdtempSync(path.join(tempBase, TEMP_PREFIX));
+  // 创建即锁定身份：真实路径 + 文件系统标识 + 写进目录的所有权标记。
+  // 清理时按这三样核对——只确认"路径还在临时区里"不够：
+  // 调用者可以把父目录（甚至允许范围内的 junction）改指到另一个临时目录，
+  // 那里若恰好有同名目录，就会误删别人的东西。
+  const ownerToken = randomUUID();
+  writeOwnerMarker(root, ownerToken);
+  const tempRootIdentity = captureDirIdentity(root, ownerToken);
   const ownsTempRoot = true;
   let cleaned = false;
   const pathOf = (...segments) => path.join(root, ...segments.map(String));
@@ -483,11 +581,14 @@ export function createHarness(options = {}) {
     return dir;
   };
   const writeFile = (relative, content) => {
-    if (path.isAbsolute(String(relative)) || String(relative).split(/[\\/]/u).includes('..')) {
+    const raw = String(relative);
+    if (path.isAbsolute(raw) || raw.split(/[\\/]/u).includes('..')) {
       throw acceptanceError('unsafe-temp-path');
     }
-    noteRoot(String(relative).split(/[\\/]/u));
-    const file = pathOf(relative);
+    // 所有权标记是清理时的身份凭据：场景不许覆盖它。
+    if (raw.split(/[\\/]/u)[0] === TEMP_OWNER_MARKER) throw acceptanceError('unsafe-temp-path');
+    noteRoot(raw.split(/[\\/]/u));
+    const file = pathOf(raw);
     fs.mkdirSync(path.dirname(file), { recursive: true });
     fs.writeFileSync(file, String(content), 'utf8');
     return file;
@@ -564,6 +665,8 @@ export function createHarness(options = {}) {
     // 仅用于报告/追溯：它不属于本 harness，cleanup 永远不删它。
     tempParentRoot: tempBase,
     tempRootSource: injectedParent === null ? 'os-tmpdir-mkdtemp' : 'caller-parent-mkdtemp',
+    // 创建时锁定的目录身份（真实路径 / dev+ino / 所有权 token），cleanup 依此拒绝"同名替换"。
+    tempRootIdentity,
     ownsTempRoot,
     injections: Object.freeze({
       now: clockSource === null ? 'virtual' : 'injected',
@@ -696,6 +799,8 @@ export function createHarness(options = {}) {
       const out = [];
       const walk = (dir) => {
         for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+          // 所有权标记是框架自己的账本，不是场景证据。
+          if (dir === root && entry.name === TEMP_OWNER_MARKER) continue;
           const full = path.join(dir, entry.name);
           if (entry.isDirectory()) walk(full);
           else out.push(path.relative(root, full).split(path.sep).join('/'));
@@ -715,15 +820,16 @@ export function createHarness(options = {}) {
     /**
      * 清理本 harness 自己 mkdtemp 出来的那个目录。幂等：第二次调用什么都不做。
      *
-     * 删之前再复核一次身份（isOwnedHarnessTempRoot）：临时区、非系统临时根、
-     * 不在仓库、实路径也没越界。复核不通过就**一个字节都不删**并返回 false——
-     * 调用者给的父目录、系统临时根、仓库永远不在删除范围内。
+     * 删之前复核身份（isSameHarnessTempRoot）：路径守卫（临时区 / 非临时根 / 非仓库 /
+     * 实路径不越界）**加上**创建时锁定的真实路径、dev+ino 与所有权标记。任何一条不符
+     * 就**一个字节都不删**并返回 false——调用者的父目录、系统临时根、仓库，以及被替换
+     * 成"同名但不是同一个"的目录，都不在删除范围内。
      * @returns {boolean} 是否真的删除了目录
      */
     cleanup() {
       if (cleaned) return false;
       cleaned = true;
-      if (!isOwnedHarnessTempRoot(root)) return false;
+      if (!isSameHarnessTempRoot(root, tempRootIdentity)) return false;
       fs.rmSync(root, { recursive: true, force: true });
       return true;
     },

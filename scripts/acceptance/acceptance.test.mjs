@@ -6,7 +6,8 @@
  *   2. 确定性：同 seed 同输入 → 报告逐字节相同；虚拟时钟可推进、外部时钟拒绝推进；
  *   3. 隔离：每个 harness 一个临时目录、cleanup 幂等；临时目录所有权——调用者给的
  *      只能是「经验证的专用父目录」，只删 harness 自己 mkdtemp 出来的子目录；
- *      系统临时根 / 仓库 / 越界实路径一律拒绝；
+ *      系统临时根 / 仓库 / 越界实路径一律拒绝；清理前按创建时锁定的身份
+ *      （真实路径 + dev/ino + 所有权标记）核对，同名替换与父目录改指都拒绝删除；
  *   4. 防护：默认 fetch 直接拒绝、全局 fetch 不被改动、checklist 源码里没有 I/O；
  *   5. 事实：每个 step 的 8 个槽位齐全、期望/实际差异可机读、非合成输入被拒；
  *   6. 计数与退出码：0=全通过、1=有失败、2=参数/框架错误，not-covered 不算通过；
@@ -39,12 +40,14 @@ import { fileURLToPath } from 'node:url';
 import {
   ACCEPTANCE_VERSION,
   REPO_ROOT,
+  TEMP_OWNER_MARKER,
   acceptanceError,
   assertSafeTempParent,
   captureConsole,
   classifyTempParent,
   createHarness,
   isOwnedHarnessTempRoot,
+  isSameHarnessTempRoot,
   projectError,
   runScenario,
 } from './harness.mjs';
@@ -353,6 +356,155 @@ test('隔离：cleanup 守卫只认自己 mkdtemp 出来的目录', () => {
   }
 });
 
+test('隔离：创建时锁定目录身份，正常 cleanup 仍成立', () => {
+  const parent = fs.mkdtempSync(path.join(os.tmpdir(), 'acc-ident-'));
+  const harness = createHarness({ tempDir: parent });
+  const root = harness.tempRoot;
+  const identity = harness.tempRootIdentity;
+  try {
+    // 身份三件套：创建时的真实路径 / dev+ino / 写进目录的所有权 token。
+    assert.equal(identity.realPath, fs.realpathSync(root));
+    assert.ok(identity.token.length >= 16, '所有权 token 太短');
+    // Windows 本地 NTFS 与指向 NTFS 的 UNC 都会给出真实的卷序列号 + 文件索引
+    // （BigInt 十进制串）；不报告 inode 的文件系统给 '0'，由 token 兜底。
+    assert.match(identity.dev, /^\d+$/u);
+    assert.match(identity.ino, /^\d+$/u);
+    assert.equal(isSameHarnessTempRoot(root, identity), true);
+
+    // 所有权标记是框架账本，不是场景证据。
+    assert.equal(fs.existsSync(path.join(root, TEMP_OWNER_MARKER)), true);
+    assert.equal(harness.tempFiles().includes(TEMP_OWNER_MARKER), false, '所有权标记漏进了证据列表');
+    harness.writeFile('nested/note.txt', 'x');
+    assert.deepEqual(harness.tempFiles(), ['nested/note.txt']);
+
+    // 正常路径：身份对得上，照常删掉自己的目录。
+    assert.equal(harness.cleanup(), true);
+    assert.equal(fs.existsSync(root), false);
+    assert.equal(fs.existsSync(parent), true);
+  } finally {
+    harness.cleanup();
+    fs.rmSync(parent, { recursive: true, force: true });
+  }
+});
+
+test('隔离：同名目录被替换后 cleanup 拒绝删除，调用者数据必须保留', () => {
+  const parent = fs.mkdtempSync(path.join(os.tmpdir(), 'acc-same-name-'));
+  const harness = createHarness({ tempDir: parent });
+  const root = harness.tempRoot;
+  const identity = harness.tempRootIdentity;
+  try {
+    // 删掉自己建的那个目录，在原位重建同名目录并放入调用者数据。
+    fs.rmSync(root, { recursive: true, force: true });
+    fs.mkdirSync(root);
+    const sentinel = path.join(root, 'caller-data.txt');
+    fs.writeFileSync(sentinel, 'do-not-delete', 'utf8');
+
+    // 路径守卫照样放行（它只确认"还在临时区里"）——这正是本条要补的口子。
+    assert.equal(isOwnedHarnessTempRoot(root), true, '路径守卫本来就该放过它（否则测不到身份核对）');
+    assert.equal(isSameHarnessTempRoot(root, identity), false);
+    assert.equal(harness.cleanup(), false);
+    assert.equal(fs.existsSync(sentinel), true, '同名替换的目录被误删');
+    assert.equal(fs.readFileSync(sentinel, 'utf8'), 'do-not-delete');
+    // 幂等：再喊一次也不删。
+    assert.equal(harness.cleanup(), false);
+    assert.equal(fs.existsSync(sentinel), true);
+
+    // 连所有权标记一起照抄：底层报 inode 时（NTFS / 指向 NTFS 的 UNC）仍认得出不是同一个目录。
+    if (identity.ino !== '0') {
+      fs.writeFileSync(path.join(root, TEMP_OWNER_MARKER), identity.token + '\n', 'utf8');
+      assert.equal(isSameHarnessTempRoot(root, identity), false, '照抄标记后仍应按 dev+ino 拒绝');
+      assert.equal(fs.existsSync(sentinel), true);
+    }
+  } finally {
+    fs.rmSync(parent, { recursive: true, force: true });
+  }
+});
+
+test('隔离：父目录联接点被改指到另一个临时目录后 cleanup 拒绝删除', () => {
+  const wrapper = fs.mkdtempSync(path.join(os.tmpdir(), 'acc-swap-wrap-'));
+  const dirA = fs.mkdtempSync(path.join(os.tmpdir(), 'acc-swap-a-'));
+  const dirB = fs.mkdtempSync(path.join(os.tmpdir(), 'acc-swap-b-'));
+  const link = path.join(wrapper, 'parent-link');
+  const linkType = process.platform === 'win32' ? 'junction' : 'dir';
+  const linkable = (() => {
+    try {
+      fs.symlinkSync(dirA, link, linkType);
+      return true;
+    } catch {
+      return false;
+    }
+  })();
+
+  try {
+    if (!linkable) {
+      // 建不了链的环境：验证"同名目录但真实路径不同"同样被身份核对拦住。
+      const harness = createHarness({ tempDir: wrapper });
+      try {
+        const decoy = path.join(dirB, path.basename(harness.tempRoot));
+        fs.mkdirSync(decoy);
+        assert.equal(isOwnedHarnessTempRoot(decoy), true);
+        assert.equal(isSameHarnessTempRoot(decoy, harness.tempRootIdentity), false);
+      } finally {
+        harness.cleanup();
+      }
+      return;
+    }
+
+    // 允许的形态：父目录本身是联接点（实路径仍在临时区里）。
+    const harness = createHarness({ tempDir: link });
+    const rootName = path.basename(harness.tempRoot);
+    const identity = harness.tempRootIdentity;
+    const realRootBefore = fs.realpathSync(harness.tempRoot);
+    // 改指到 dirB，并在那里放一个同名目录（带调用者数据）。
+    fs.unlinkSync(link);
+    fs.symlinkSync(dirB, link, linkType);
+    const decoy = path.join(dirB, rootName);
+    fs.mkdirSync(decoy);
+    const sentinel = path.join(decoy, 'caller-data.txt');
+    fs.writeFileSync(sentinel, 'do-not-delete', 'utf8');
+
+    // 词法路径一模一样、也仍在临时区里：路径守卫放行，只有身份核对能拦住。
+    assert.equal(harness.tempRoot, path.join(path.resolve(link), rootName));
+    assert.equal(isOwnedHarnessTempRoot(harness.tempRoot), true);
+    assert.equal(isSameHarnessTempRoot(harness.tempRoot, identity), false);
+    assert.equal(harness.cleanup(), false);
+    assert.equal(fs.existsSync(sentinel), true, '改指后误删了另一个目录的内容');
+    assert.equal(fs.readFileSync(sentinel, 'utf8'), 'do-not-delete');
+    // 拒绝删除 ≠ 搬走：原来的目录还在原处。
+    assert.equal(fs.existsSync(realRootBefore), true);
+  } finally {
+    // 先解链，再删自己的合成目录（绝不顺着链接递归）。
+    try {
+      if (fs.lstatSync(link).isSymbolicLink()) fs.unlinkSync(link);
+    } catch { /* 没建成就跳过 */ }
+    for (const dir of [wrapper, dirA, dirB]) fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('隔离：ino 不可用（部分 FAT / SMB / UNC）时靠所有权标记兜底', () => {
+  const parent = fs.mkdtempSync(path.join(os.tmpdir(), 'acc-ino-'));
+  const harness = createHarness({ tempDir: parent });
+  const root = harness.tempRoot;
+  const identity = harness.tempRootIdentity;
+  try {
+    // 模拟"文件系统不报 inode"：只剩真实路径 + token 两层。
+    const noIno = Object.freeze({ ...identity, dev: '0', ino: '0' });
+    assert.equal(isSameHarnessTempRoot(root, noIno), true);
+    assert.equal(isSameHarnessTempRoot(root, { ...noIno, token: 'not-our-token' }), false);
+    assert.equal(isSameHarnessTempRoot(root, { ...noIno, realPath: path.join(parent, 'elsewhere') }), false);
+    assert.equal(isSameHarnessTempRoot(root, { ...noIno, token: '' }), false);
+    assert.equal(isSameHarnessTempRoot(root, null), false);
+
+    // 标记被删 → 身份不成立（fail closed），目录不删。
+    fs.rmSync(path.join(root, TEMP_OWNER_MARKER), { force: true });
+    assert.equal(isSameHarnessTempRoot(root, identity), false);
+    assert.equal(harness.cleanup(), false);
+    assert.equal(fs.existsSync(root), true);
+  } finally {
+    fs.rmSync(parent, { recursive: true, force: true });
+  }
+});
+
 test('隔离：软链接 / 联接点不得把专用父目录指到仓库或系统临时根', () => {
   const parent = fs.mkdtempSync(path.join(os.tmpdir(), 'acc-link-'));
   const linkToRepo = path.join(parent, 'link-to-repo');
@@ -415,6 +567,8 @@ test('隔离：writeFile 拒绝跳出临时目录的相对路径', () => {
   try {
     assert.throws(() => harness.writeFile('../../escape.txt', 'x'), (error) => error.code === 'unsafe-temp-path');
     assert.throws(() => harness.writeFile(path.join(os.tmpdir(), 'abs.txt'), 'x'), (error) => error.code === 'unsafe-temp-path');
+    // 所有权标记是清理时的身份凭据，场景不许覆盖。
+    assert.throws(() => harness.writeFile(TEMP_OWNER_MARKER, 'x'), (error) => error.code === 'unsafe-temp-path');
   } finally {
     harness.cleanup();
   }
