@@ -8,7 +8,10 @@
  *                   index.js#main / tools/registry / media/* / presence-qq-runtime.js），
  *                   外部世界一律用假 bot、脚本化假 brain、临时目录、虚拟时钟。
  *   not-covered  —— 依赖本 checkout 里**不存在**的东西（宿主集成、QQ/OneBot 集成、
- *                   计划文档里的语义），因此**没有**执行证据；不用纯桩断言冒充验收。
+ *                   Web presence 宿主路径），因此**没有**执行证据；不用纯桩断言冒充验收。
+ *
+ * C 门离线 presence：C-03/C-04/C-05…C-09 在 presence-scenarios.mjs，全部用
+ * 合成 OneBot + 虚拟时钟；C-01/C-02 缺 Web presence 宿主路径，保持 not-covered。
  *
  * D/E 离线契约：D-01…D-03 复用 media/* 的 ASR/TTS 桩，E-01…E-04 复用
  * tools/registry 的 fake tool；D-04/D-05/E-05 仍显式保留为 not-covered。
@@ -40,6 +43,8 @@ import { createToolRegistry } from '../../packages/companion/src/tools/registry.
 import { ingestAudio, renderVoice } from '../../packages/companion/src/media/pipeline.js';
 import { createOfflineAsrStub, createOfflineTtsStub } from '../../packages/companion/src/media/offline-stub.js';
 import { createMediaStore } from '../../packages/companion/src/media/store.js';
+
+import { C_NOT_COVERED, C_SCENARIOS } from './presence-scenarios.mjs';
 
 /** 合成会话键 / 对方 id：全部是占位值，不对应任何真实账号。 */
 const KEY = 'private:visitor-1';
@@ -2508,7 +2513,7 @@ async function runE04(harness) {
 /* ══════════════════════ 场景表 ══════════════════════ */
 
 /**
- * 未覆盖项：依赖本 checkout 里不存在的宿主集成 / QQ 集成 / 计划文档。
+ * 未覆盖项：依赖本 checkout 里不存在的宿主集成 / QQ 集成 / Web presence 宿主。
  * 按 id 建索引（不按下标），增删一条不会让场景表悄悄错位。
  */
 const NOT_COVERED = Object.freeze(Object.fromEntries([
@@ -2527,18 +2532,6 @@ const NOT_COVERED = Object.freeze(Object.fromEntries([
   reason,
   requires: '宿主集成路径或 QQ/OneBot 集成路径（本 checkout 不存在）',
 }])));
-
-/** C 组：计划文档不在本 checkout，无法枚举子场景 id，只能按组标未覆盖。 */
-const GROUP_NOT_COVERED = [
-  ['C-*', 'C 组（计划文档未随本 checkout 提供，无法枚举子场景）'],
-].map(([id, title]) => ({
-  id,
-  gate: 'group',
-  status: 'not-covered',
-  title,
-  reason: 'plan-document-absent',
-  requires: '宿主集成计划文档（本 checkout 不存在）',
-}));
 
 /**
  * D/E 未覆盖项：仍显式保留为 not-covered，不用 X-03/X-04 的增补旁证冒充 D/E 验收。
@@ -2595,6 +2588,8 @@ export const SCENARIOS = Object.freeze([
   { id: 'B-16', aliases: ['context-budget'], gate: 'b', status: 'covered', title: 'B-16 上下文预算：按 recent → memory → situation 丢弃', run: runB16 },
   { id: 'B-17', aliases: ['generation-delivery-commit'], gate: 'b', status: 'covered', title: 'B-17 生成 / 投递 / 记忆提交分离', run: runB17 },
   NOT_COVERED['B-18'],
+  ...C_NOT_COVERED,
+  ...C_SCENARIOS,
   { id: 'X-01', aliases: ['tool-confirmation'], gate: 'extra', status: 'covered', title: 'X-01（增补）工具确认一次性 / 高风险永不执行', run: runX01 },
   { id: 'X-02', aliases: ['reminder-store-integrity'], gate: 'extra', status: 'covered', title: 'X-02（增补）提醒快照 fail-closed，坏文件不被抹掉', run: runX02 },
   { id: 'X-03', aliases: ['tool-audit-boundary'], gate: 'extra', status: 'covered', title: 'X-03（增补）工具确认绑定参数、一次性消费，审计不含正文', run: runX03 },
@@ -2613,7 +2608,6 @@ export const SCENARIOS = Object.freeze([
   { id: 'E-03', aliases: ['tool-timeout'], gate: 'extra', status: 'covered', title: 'E-03 工具超时：结构化 timeout + 审计，不伪成功', run: runE03 },
   { id: 'E-04', aliases: ['high-risk-tool'], gate: 'extra', status: 'covered', title: 'E-04 高风险工具：默认 risk-not-allowed，永不执行', run: runE04 },
   DE_NOT_COVERED['E-05'],
-  ...GROUP_NOT_COVERED,
 ].map((scenario) => Object.freeze(scenario)));
 
 /** 取场景表（默认内置；测试可注入自己的表）。 */
@@ -2645,5 +2639,19 @@ export function bGateIds(registry = SCENARIOS) {
 export function notCoveredBIds(registry = SCENARIOS) {
   return listScenarios(registry)
     .filter((scenario) => scenario.gate === 'b' && scenario.status === 'not-covered')
+    .map((scenario) => scenario.id);
+}
+
+/** 已登记的 C 场景。 */
+export function cGateIds(registry = SCENARIOS) {
+  return listScenarios(registry)
+    .filter((scenario) => scenario.gate === 'group')
+    .map((scenario) => scenario.id);
+}
+
+/** 未覆盖的 C 门 id。 */
+export function notCoveredCIds(registry = SCENARIOS) {
+  return listScenarios(registry)
+    .filter((scenario) => scenario.gate === 'group' && scenario.status === 'not-covered')
     .map((scenario) => scenario.id);
 }

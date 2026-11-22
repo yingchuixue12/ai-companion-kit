@@ -54,11 +54,13 @@ import {
 import {
   SCENARIOS,
   bGateIds,
+  cGateIds,
   coveredScenarios,
   findScenario,
   isTapAllPassed,
   listScenarios,
   notCoveredBIds,
+  notCoveredCIds,
 } from './scenarios.mjs';
 import {
   EXIT_OK,
@@ -926,13 +928,21 @@ test('场景表：B 门分母是 18，未覆盖 id 与 covered id 不重叠', ()
     assert.ok(!bGateIds().includes(extra), extra + ' 不该进 B 门分母');
     assert.ok(covered.includes(extra), extra + ' 应作为增补场景被执行');
   }
+  // C 门是独立门槛：只加证据，不改变 B 门分母，也不混进 extra 计数。
+  for (const c of ['C-03', 'C-04', 'C-05', 'C-07', 'C-08', 'C-09']) {
+    assert.ok(!bGateIds().includes(c), c + ' 不该进 B 门分母');
+    assert.ok(covered.includes(c), c + ' 应作为 C 门场景被执行');
+  }
+  assert.equal(cGateIds().length, 8);
+  assert.deepEqual(notCoveredCIds(), ['C-01', 'C-02']);
   assert.equal(
     listScenarios().filter((scenario) => scenario.gate === 'extra' && scenario.status === 'covered').length,
     13,
   );
-  // covered 总数 = 11 个 B 门 + 13 个增补；not-covered 是 7 个 B 门 + 3 个 D/E + 1 个 C 组。
-  assert.equal(covered.length, 24);
-  assert.equal(listScenarios().length, 35);
+  // covered 总数 = 11 个 B 门 + 6 个 C 门 + 13 个增补；
+  // not-covered 是 7 个 B 门 + 2 个 C 门 + 3 个 D/E。
+  assert.equal(covered.length, 30);
+  assert.equal(listScenarios().length, 42);
   // 缺失的宿主 / QQ 集成路径在本 checkout 里确实不存在：用场景表登记证明，
   // 不断言任何私有目录名（公开 fork 不依赖私有宿主路径）。
   assert.equal(findScenario('B-03').status, 'not-covered');
@@ -1064,18 +1074,22 @@ test('runner：默认执行整表，退出码 0，覆盖分母与未覆盖列表
   assert.equal(report.version, ACCEPTANCE_VERSION);
   assert.equal(report.summary.failed, 0);
   assert.equal(report.summary.passed, coveredScenarios().length);
-  // summary.passed 包括增补场景，B 门通过数必须单独可读。
+  // summary.passed 包括 C 与增补场景，B 门通过数必须单独可读。
   assert.equal(report.summary.bGatePassed, 11);
-  assert.equal(report.summary.passed - report.summary.bGatePassed, 13);
+  assert.equal(report.summary.cGatePassed, 6);
+  assert.equal(report.summary.passed - report.summary.bGatePassed, 19);
   assert.equal(report.summary.coverageDenominator, 18);
+  assert.equal(report.summary.cGateCoverageDenominator, 8);
   assert.equal(report.summary.completeBGate, false, 'completeBGate 必须保持 false');
+  assert.equal(report.summary.offlineCGateComplete, false, 'C-01/C-02 仍是永久缺口');
   assert.equal(report.coverage.denominator, 18);
   assert.equal(report.coverage.scope, 'full-registry');
   assert.deepEqual(report.coverage.coveredBIds, [
     'B-01', 'B-02', 'B-06', 'B-07', 'B-08', 'B-09', 'B-10', 'B-11', 'B-13', 'B-16', 'B-17',
   ]);
-  // 增补场景按执行顺序出现在 extraExecutedIds 里，且不进入 B 门的任何列表。
+  // C 与增补场景按执行顺序出现在 extraExecutedIds 里，且不进入 B 门的任何列表。
   assert.deepEqual(report.coverage.extraExecutedIds, [
+    'C-03', 'C-04', 'C-05', 'C-07', 'C-08', 'C-09',
     'X-01', 'X-02', 'X-03', 'X-04', 'X-05', 'X-06',
     'D-01', 'D-02', 'D-03', 'E-01', 'E-02', 'E-03', 'E-04',
   ]);
@@ -1084,13 +1098,19 @@ test('runner：默认执行整表，退出码 0，覆盖分母与未覆盖列表
     assert.ok(!report.coverage.notExecutedBIds.includes(extra), extra + ' 混进了 notExecutedBIds');
   }
   assert.deepEqual(report.coverage.notCoveredBIds, notCoveredBIds());
+  assert.deepEqual(report.coverage.notCoveredCIds, notCoveredCIds());
+  assert.deepEqual(report.coverage.coveredCIds, [
+    'C-03', 'C-04', 'C-05', 'C-07', 'C-08', 'C-09',
+  ]);
+  assert.deepEqual(report.coverage.missingCIds, ['C-01', 'C-02']);
+  assert.deepEqual(report.coverage.notExecutedCIds, []);
   assert.ok(report.coverage.missingBIds.includes('B-03'));
-  assert.deepEqual(report.coverage.groupIds, ['C-*']);
+  assert.deepEqual(report.coverage.groupIds, ['C-01', 'C-02']);
   assert.equal(report.summary.notCovered, report.summary.total - report.summary.executed);
-  // 35 项 = 18 个 B 门 + 13 个增补 + 3 个 D/E 未覆盖 + 1 个 C 组。
-  assert.equal(report.summary.total, 35);
-  assert.equal(report.summary.executed, 24);
-  assert.equal(report.summary.notCovered, 11);
+  // 42 项 = 18 个 B 门 + 8 个 C 门 + 13 个增补 + 3 个 D/E 未覆盖。
+  assert.equal(report.summary.total, 42);
+  assert.equal(report.summary.executed, 30);
+  assert.equal(report.summary.notCovered, 12);
   // 生成时间来自虚拟时钟：必须显式标注来源，避免被当成真实墙钟。
   assert.equal(report.generatedAtSource, 'harness-virtual-clock');
   assert.equal(report.generatedAt, '2026-01-01T00:00:00.000Z');
@@ -1618,7 +1638,8 @@ test('场景表：SCENARIOS 与 findScenario/coveredScenarios 口径一致', () 
 });
 
 test('场景定义：期望值是字面量，不引用产品常量（否则产品改了就恒真）', async () => {
-  const source = fs.readFileSync(path.join(HERE, 'scenarios.mjs'), 'utf8');
+  const sources = ['scenarios.mjs', 'presence-scenarios.mjs']
+    .map((file) => fs.readFileSync(path.join(HERE, file), 'utf8'));
   for (const constant of [
     'DEFAULT_DROP_ORDER',
     'TOOL_RESULT_CODES',
@@ -1634,11 +1655,13 @@ test('场景定义：期望值是字面量，不引用产品常量（否则产�
   ]) {
     // 只查"真的用上了"（import 或成员访问），注释里提到名字不算。
     const usage = new RegExp('\\b' + constant + '\\s*[.[]|import[^;\\n]*\\b' + constant + '\\b', 'u');
-    assert.equal(
-      usage.test(source),
-      false,
-      '场景表引用了产品常量 ' + constant + '：期望值会跟着产品走，断言恒真',
-    );
+    for (const source of sources) {
+      assert.equal(
+        usage.test(source),
+        false,
+        '场景表引用了产品常量 ' + constant + '：期望值会跟着产品走，断言恒真',
+      );
+    }
   }
 
   const harness = createHarness();
@@ -1928,7 +1951,38 @@ test('runner：B-08 提醒不覆盖在途消息、消息不吞掉到期提醒，
   ]);
 });
 
-/* ═══════════════ 14. D/E 离线契约场景（D-01…D-03 / E-01…E-04） ═══════════════ */
+/* ═══════════ 14. C 门离线 presence（C-03/C-04/C-05…C-09） ═══════════ */
+
+test('C 矩阵：六个离线 presence 场景全部 pass；C-01/C-02 仍 not-covered；B 门不变', async () => {
+  const harness = createHarness();
+  const capture = captureConsole();
+  try {
+    for (const id of ['C-03', 'C-04', 'C-05', 'C-07', 'C-08', 'C-09']) {
+      const result = await runScenario(id, { harness });
+      assert.equal(result.status, 'pass', id + ' 未通过：' + JSON.stringify(result.diagnostics));
+      assert.equal(result.gate, 'group');
+      assert.ok(result.steps.length >= 2, id + ' 的证据步数不足');
+      assert.equal(typeof result.artifacts.limitation, 'string', id + ' 缺少合成证据范围说明');
+    }
+    for (const id of ['C-01', 'C-02']) {
+      const result = await runScenario(id, { harness });
+      assert.equal(result.status, 'not-covered', id + ' 不该被当成通过');
+      assert.equal(result.ok, false);
+      assert.deepEqual(result.steps, []);
+      assert.equal(result.diagnostics[0].code, 'not-covered');
+    }
+    assert.equal(findScenario('C-06').id, 'C-05');
+    assert.equal(findScenario('C-05').status, 'covered');
+    // C 门独立计分，B 门分母与永久缺口都不动。
+    assert.equal(bGateIds().length, 18);
+    assert.equal(notCoveredBIds().length, 7);
+  } finally {
+    capture.restore();
+    harness.cleanup();
+  }
+});
+
+/* ═══════════════ 15. D/E 离线契约场景（D-01…D-03 / E-01…E-04） ═══════════════ */
 
 test('D-01：离线 ASR 桩返回转写/置信度/元数据，且没有 memory port 时不写长期记忆', async () => {
   const harness = createHarness();

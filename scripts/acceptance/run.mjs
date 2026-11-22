@@ -35,9 +35,11 @@ import {
 import {
   SCENARIOS,
   bGateIds,
+  cGateIds,
   findScenario,
   listScenarios,
   notCoveredBIds,
+  notCoveredCIds,
 } from './scenarios.mjs';
 
 export const EXIT_OK = 0;
@@ -182,15 +184,35 @@ export function buildReport({
   // 整表跑（默认）还是只跑了一个场景：决定 coverage 字段该怎么读。
   const scope = results.length === registryIds.length ? 'full-registry' : 'partial';
 
+  // C 门独立计分：C-01/C-02 仍缺 Web 宿主。
+  const cDenominators = cGateIds(registry);
+  const passedC = executed
+    .filter((item) => item.gate === 'group' && item.status === 'pass')
+    .map((item) => item.id);
+  const passedCSet = new Set(passedC);
+  const cGaps = notCoveredCIds(registry);
+  const cCoveredInRegistry = cDenominators.filter((id) => !cGaps.includes(id));
+  const cNotExecuted = cCoveredInRegistry.filter((id) => !passedCSet.has(id));
+  const cMissing = cDenominators.filter((id) => !passedCSet.has(id));
+  const offlineCGateComplete = cGaps.length === 0 && cNotExecuted.length === 0;
+
   const reasons = [];
   if (permanentGaps.length > 0) {
     reasons.push(permanentGaps.length + ' 个完全没有离线可执行证据（' + permanentGaps.join(' ') + '）');
   }
   if (notExecuted.length > 0) reasons.push('另有 ' + notExecuted.length + ' 个本次未执行');
-  if (notCovered.some((item) => item.gate === 'group')) reasons.push('C 组未覆盖');
   const gateReason = completeBGate
     ? 'B 门 ' + denominators.length + ' 项都有可执行证据，且本次全部通过。'
     : 'B 门 ' + denominators.length + ' 项尚未全部有可执行证据：' + reasons.join('；') + '。';
+
+  const cReasons = [];
+  if (cGaps.length > 0) {
+    cReasons.push(cGaps.length + ' 个 C 项没有离线可执行证据（' + cGaps.join(' ') + '）');
+  }
+  if (cNotExecuted.length > 0) cReasons.push('另有 ' + cNotExecuted.length + ' 个 C 项本次未执行');
+  const cGateReason = cReasons.length > 0
+    ? 'C 门 ' + cDenominators.length + ' 项尚未全部有离线可执行证据：' + cReasons.join('；') + '。'
+    : 'C 门 ' + cDenominators.length + ' 项离线项本次全部通过；C-04 真实平台部分仍需 T9，不等于 C 门整体通过。';
 
   return {
     version: ACCEPTANCE_VERSION,
@@ -222,10 +244,13 @@ export function buildReport({
       passed: executed.filter((item) => item.status === 'pass').length,
       failed: failed.length,
       notCovered: notCovered.length,
-      // B 门通过数单独给：summary.passed 里还包含 X-01/X-02 这类增补场景。
+      // B 门通过数单独给：summary.passed 里还包含 C 与 X-01/X-02 这类增补场景。
       bGatePassed: passedB.length,
+      cGatePassed: passedC.length,
       coverageDenominator: denominators.length,
+      cGateCoverageDenominator: cDenominators.length,
       completeBGate,
+      offlineCGateComplete,
       ok: failed.length === 0,
     },
     coverage: {
@@ -239,9 +264,17 @@ export function buildReport({
       // 有可执行证据，但这次没跑（例如 --scenario 只跑了一个）
       notExecutedBIds: notExecuted,
       missingBIds: missingB,
-      // 非 B 门（X-01/X-02）里本次真正执行过的 id（通过与否都列，失败看 scenarios）。
-      extraExecutedIds: executed.filter((item) => item.gate !== 'b').map((item) => item.id),
+      // 保留 v1 的未覆盖组字段，发布门禁据此交叉核对。
       groupIds: notCovered.filter((item) => item.gate === 'group').map((item) => item.id),
+      cGateIds: cDenominators,
+      coveredCIds: cDenominators.filter((id) => passedCSet.has(id)),
+      notCoveredCIds: cGaps,
+      notExecutedCIds: cNotExecuted,
+      missingCIds: cMissing,
+      offlineCGateComplete,
+      cGateReason,
+      // 非 B 门（C / X / D / E）里本次真正执行过的 id（通过与否都列，失败看 scenarios）。
+      extraExecutedIds: executed.filter((item) => item.gate !== 'b').map((item) => item.id),
       gateReason,
     },
     artifacts: { ...artifacts },
@@ -255,7 +288,8 @@ export function formatList(registry = SCENARIOS) {
   const lines = [];
   const covered = scenarios.filter((item) => item.status === 'covered').length;
   lines.push('场景表（' + scenarios.length + ' 项：covered ' + covered
-    + ' · not-covered ' + (scenarios.length - covered) + ' · B 门分母 ' + bGateIds(registry).length + '）：');
+    + ' · not-covered ' + (scenarios.length - covered) + ' · B 门分母 ' + bGateIds(registry).length
+    + ' · C 门分母 ' + cGateIds(registry).length + '）：');
   for (const scenario of scenarios) {
     const mark = scenario.status === 'covered' ? '[covered]    ' : '[not-covered]';
     const reason = scenario.status === 'covered' ? '' : '  ← ' + (scenario.reason ?? 'unknown');
@@ -307,6 +341,12 @@ export function formatHuman(report) {
     + ' · 口径 ' + report.coverage.scope + '）');
   lines.push('  completeBGate: ' + (report.summary.completeBGate ? 'true' : 'false'));
   lines.push('  ' + report.coverage.gateReason);
+  lines.push('  C 门证据 ' + report.coverage.coveredCIds.length + '/' + report.coverage.cGateIds.length
+    + '（未覆盖 ' + report.coverage.notCoveredCIds.length
+    + ' · 本次未执行 ' + report.coverage.notExecutedCIds.length
+    + ' · 口径 ' + report.coverage.scope + '）');
+  lines.push('  offlineCGateComplete: ' + (report.summary.offlineCGateComplete ? 'true' : 'false'));
+  lines.push('  ' + report.coverage.cGateReason);
   if (report.summary.failed > 0) lines.push('  ❌ 已执行的场景有失败');
   else if (report.summary.executed > 0) lines.push('  ✅ 已执行范围全通过（未覆盖项不计入通过）');
   return lines.join('\n');
