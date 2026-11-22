@@ -440,14 +440,18 @@ export class MemoryStore {
    * 过期语义（保守失败优先于破坏互斥）：
    *   - 持锁 pid 仍活着：不因 mtime 老而偷锁；等到 lockWaitMs 后
    *     `store-lock-timeout`。
-   *   - 持锁 pid 已退出：视为崩溃遗留，直接 `store-lock-orphaned`，不自动删除
-   *     （避免与另一个正在接管新锁的进程竞态）。需人工确认后删 `.write.lock`。
+   *   - 持锁 pid 已退出：重读锁文件确认身份。若仍是同一把锁（pid 与 token
+   *     都未变），视为崩溃遗留，`store-lock-orphaned`，不自动删除（避免与
+   *     另一个正在接管新锁的进程竞态）。需人工确认后删 `.write.lock`。
+   *   - 重读时锁已消失或已被更换：原持有者可能刚好正常释放并退出，锁也可
+   *     能被另一个进程接管；不删别人的锁，在 lockWaitMs 内重试。
    *   - 锁内容缺失/不可解析：等到超时后 `store-lock-unreadable`。
    */
   #acquireLock() {
     fs.mkdirSync(this.dir, { recursive: true });
     const deadline = Date.now() + this.lockWaitMs;
     const token = randomUUID();
+    let retriedReleasedLockAtDeadline = false;
     while (true) {
       try {
         const fd = fs.openSync(this.lockFile, 'wx');
@@ -466,21 +470,46 @@ export class MemoryStore {
           throw new MemoryStoreError('v2 记忆写锁创建失败：' + String(error?.code || error?.name || 'unknown'), 'store-lock-failed');
         }
         const lock = this.#readLock();
-        if (lock.ok && this.#processAlive(lock.pid)) {
+        if (!lock.ok) {
+          if (Date.now() >= deadline) {
+            throw new MemoryStoreError('v2 记忆写锁状态不可读', 'store-lock-unreadable');
+          }
+          // missing（刚好释放）或 unreadable（对方正在写内容）：短暂重试。
+          sleepMs(lock.reason === 'missing' ? 5 : 10);
+          continue;
+        }
+        if (this.#processAlive(lock.pid)) {
           if (Date.now() >= deadline) {
             throw new MemoryStoreError('v2 记忆写锁被活进程持有，等待超时', 'store-lock-timeout');
           }
           sleepMs(10);
           continue;
         }
-        if (lock.ok && !this.#processAlive(lock.pid)) {
-          throw new MemoryStoreError('v2 记忆写锁属于已退出进程，需人工确认后清理 .write.lock', 'store-lock-orphaned');
+        // 进程已失活：先重读锁身份。原持有者可能在“读锁”和“查活”之间正常
+        // 释放并退出（锁消失），也可能锁已被另一个进程接管（pid/token 变了）；
+        // 这两种都不是这把锁的崩溃遗留，不删别人的锁。
+        const recheck = this.#readLock();
+        if (!recheck.ok) {
+          if (Date.now() >= deadline) {
+            // 观察到正常释放时允许最后一次立即竞争，反复变化仍受期限约束。
+            if (recheck.reason !== 'missing' || retriedReleasedLockAtDeadline) {
+              throw new MemoryStoreError('v2 记忆写锁状态不可读', 'store-lock-unreadable');
+            }
+            retriedReleasedLockAtDeadline = true;
+            continue;
+          }
+          sleepMs(recheck.reason === 'missing' ? 5 : 10);
+          continue;
         }
-        if (Date.now() >= deadline) {
-          throw new MemoryStoreError('v2 记忆写锁状态不可读', 'store-lock-unreadable');
+        if (recheck.pid !== lock.pid || recheck.token !== lock.token) {
+          // 已被另一把锁接管：只在 lockWaitMs 内继续等待，避免无限重试。
+          if (Date.now() >= deadline) {
+            throw new MemoryStoreError('v2 记忆写锁在等待期间被其他进程接管，等待超时', 'store-lock-timeout');
+          }
+          sleepMs(10);
+          continue;
         }
-        // missing（刚好释放）或 unreadable（对方正在写内容）：短暂重试。
-        sleepMs(lock.reason === 'missing' ? 5 : 10);
+        throw new MemoryStoreError('v2 记忆写锁属于已退出进程，需人工确认后清理 .write.lock', 'store-lock-orphaned');
       }
     }
   }
