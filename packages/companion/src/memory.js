@@ -171,11 +171,26 @@ export class Memory {
   /** 把某人的账渲染成一段可注入的文字 */
   renderPerson(id) {
     const p = this.#readAll()[String(id)];
+    return this.#renderPerson(id, p, p?.topics?.length ? p.topics.slice(-8) : []);
+  }
+
+  /** 从当前账本快照按记录顺序移除最旧的完整话题。 */
+  personTopicView(id) {
+    const p = this.#readAll()[String(id)];
+    const topics = Array.isArray(p?.topics) ? p.topics.slice(-8) : [];
+    return {
+      text: this.#renderPerson(id, p, topics),
+      topicCount: topics.length,
+      renderFrom: (dropped) => this.#renderPerson(id, p, topics.slice(dropped)),
+    };
+  }
+
+  #renderPerson(id, p, topics) {
     if (!p) return '';
     const L = [];
     if (p.traits?.length) L.push('你了解他：' + p.traits.slice(-12).join('；'));
     if (p.facts?.length) L.push('他告诉过你：' + p.facts.slice(-12).join('；'));
-    if (p.topics?.length) L.push('你们聊过：' + p.topics.slice(-8).join('；'));
+    if (topics?.length) L.push('你们聊过：' + topics.join('；'));
     if (p.pending?.length) L.push('⚠️ 你心里还记着没说出口的事：' + p.pending.slice(-4).join('；'));
     if (p.interactions) L.push('你们互动过 ' + p.interactions + ' 次');
     if (!L.length) return '';

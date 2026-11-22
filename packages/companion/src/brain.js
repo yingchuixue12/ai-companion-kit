@@ -97,8 +97,11 @@ export class Brain {
     let body = JSON.stringify(payload(parts));
     if (body.length > this.maxInputChars) {
       // ① 先按最近对话的记录顺序，从最旧开始移除完整轮次（按真实序列化 payload 量，能放下即停）；
-      // ② 仍然放不下，才沿用 recent → memory → situation 整块丢弃（platform / history / 用户原文不动）。
-      const trimmed = this.#dropOldestRounds(parts, recentView, measure);
+      // ② 放弃最近对话后，仍超预算则按整条裁剪旧话题。最后沿用整块丢弃。
+      const recentTrimmed = this.#dropOldestRounds(parts, recentView, measure);
+      const trimmed = measure(recentTrimmed) <= this.maxInputChars
+        ? recentTrimmed
+        : this.#dropOldestTopics(recentTrimmed, userId, measure);
       const plan = planContextBudget({
         measure,
         parts: trimmed,
@@ -176,6 +179,20 @@ export class Brain {
       }
       if (typeof recent !== 'string') return parts;
       const candidate = { ...parts, recent };
+      if (measure(candidate) <= this.maxInputChars) return candidate;
+    }
+    return parts;
+  }
+
+  #dropOldestTopics(parts, userId, measure) {
+    if (!parts.memory) return parts;
+    const withoutRecent = { ...parts, recent: '' };
+    if (measure(withoutRecent) <= this.maxInputChars) return withoutRecent;
+    const view = this.memory.personTopicView?.(userId);
+    // 自定义渲染或不同的账本快照沿用整块预算，避免替换原始记忆。
+    if (!view || view.text !== parts.memory) return parts;
+    for (let dropped = 1; dropped <= view.topicCount; dropped += 1) {
+      const candidate = { ...withoutRecent, memory: view.renderFrom(dropped) };
       if (measure(candidate) <= this.maxInputChars) return candidate;
     }
     return parts;
