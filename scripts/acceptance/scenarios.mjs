@@ -5,7 +5,8 @@
  *   covered      —— 有**可执行**证据：跑的是本 checkout 里真实存在的产品模块
  *                   （handleTurn / Humanizer / ConversationWindow / Waker / Memory /
  *                   Role / context-budget / reminder-* / reminder-commands /
- *                   index.js#main / tools/registry / media/* / presence-qq-runtime.js），
+ *                   index.js#main / tools/registry / tools/host-bridge /
+ *                   media/*（含 voice-runtime）/ presence-qq-runtime.js），
  *                   外部世界一律用假 bot、脚本化假 brain、临时目录、虚拟时钟。
  *   not-covered  —— 依赖本 checkout 里**不存在**的东西（宿主集成、QQ/OneBot 集成、
  *                   Web presence 宿主路径），因此**没有**执行证据；不用纯桩断言冒充验收。
@@ -13,9 +14,10 @@
  * C 门离线 presence：C-03/C-04/C-05…C-09 在 presence-scenarios.mjs，全部用
  * 合成 OneBot + 虚拟时钟；C-01/C-02 缺 Web presence 宿主路径，保持 not-covered。
  *
- * D/E 离线契约：D-01…D-03 复用 media/* 的 ASR/TTS 桩，E-01…E-04 复用
- * tools/registry 的 fake tool；D-04/D-05/E-05 仍显式保留为 not-covered。
- * 这些是离线契约证据，不是真实语音/工具/供应商验收。
+ * D/E 离线契约：D-01…D-04 复用 media/* 的 ASR/TTS 桩与 voice-runtime 公开入口，
+ * E-01…E-05 复用 tools/registry 的 fake tool 与 host-bridge 公开入口；
+ * D-05 仍显式保留为 not-covered（缺宿主附件入口）。这些是离线契约证据，
+ * 不是真实语音/工具/供应商验收。
  *
  * 约定（写新场景时请守住）：
  *   1. 只填合成输入：`input.synthetic` 由框架强制为 true，写 false 会直接失败；
@@ -43,6 +45,7 @@ import { createToolRegistry } from '../../packages/companion/src/tools/registry.
 import { ingestAudio, renderVoice } from '../../packages/companion/src/media/pipeline.js';
 import { createOfflineAsrStub, createOfflineTtsStub } from '../../packages/companion/src/media/offline-stub.js';
 import { createMediaStore } from '../../packages/companion/src/media/store.js';
+import { createToolHostBridge, createVoiceRuntime } from '../../packages/companion/src/lib.js';
 
 import { C_NOT_COVERED, C_SCENARIOS } from './presence-scenarios.mjs';
 
@@ -2270,6 +2273,187 @@ async function runD03(harness) {
   };
 }
 
+/* ═══════════════ D-04 低置信度先确认（语音运行入口） ═══════════════ */
+
+/**
+ * D-04：公开 createVoiceRuntime() 的低置信度路径——转写在确认前不进聊天、不写长期记忆；
+ * 确认后只处理一次（同一条转写重复确认拿不到第二次聊天/记忆写入）。
+ *
+ * 合成测试：ASR 是 offline-asr-stub，记忆是内存端口，媒体存储落在 harness 临时目录；
+ * 不接真实 ASR / 供应商，不发送任何消息。入参额外带 confirmed=true 作为绕过尝试，
+ * 入口必须忽略它，仍然先挂待确认。
+ */
+async function runD04(harness) {
+  const store = createMediaStore({
+    root: harness.dirOf('d04/store'),
+    now: () => harness.now(),
+    retentionMs: 60 * 60 * 1000,
+  });
+  const transcriptText = '合成低置信度转写';
+  const writes = [];
+  const memoryPort = {
+    async remember(record) {
+      writes.push({
+        chars: [...String(record?.text ?? '')].length,
+        confidence: record?.confidence,
+        source: record?.source,
+      });
+    },
+  };
+  const runtime = createVoiceRuntime({
+    enabled: true,
+    asr: createOfflineAsrStub({
+      transcripts: [{ text: transcriptText, confidence: 0.2, language: 'zh' }],
+    }),
+    store,
+    memory: memoryPort,
+    minConfidence: 0.6,
+    now: () => harness.now(),
+  });
+
+  const payload = Buffer.from('d04-synthetic-audio-bytes', 'utf8');
+  const input = {
+    kind: 'audio',
+    mime: 'audio/ogg',
+    size: payload.length,
+    durationMs: 900,
+    ref: 'synthetic://d04/voice-1',
+    bytes: payload,
+    // 绕过尝试：确认只能走 confirm(id)，入参上的 confirmed 不得放行。
+    confirmed: true,
+  };
+
+  /** 只统计产品真正交出的聊天结果；不在这里替产品决定"进没进聊天"。 */
+  const chats = [];
+  const track = (result) => {
+    if (result && result.chat !== null && result.chat !== undefined) chats.push(result.chat);
+    return result;
+  };
+
+  try {
+    const pending = track(await runtime.ingest({ input }));
+    const pendingRows = runtime.listPending();
+
+    harness.step({
+      title: '低置信度：先挂待确认——不进聊天、不写记忆，入参 confirmed 不能绕过',
+      input: {
+        kind: 'audio-message',
+        items: [{ text: 'synthetic audio d04 low-confidence', userId: VISITOR }],
+        note: '合成音频 + offline-asr-stub（confidence=0.2，阈值 0.6）；'
+          + '入参额外带 confirmed=true 作为绕过尝试',
+      },
+      expected: {
+        ok: true,
+        decision: 'needs-confirmation',
+        chatEntries: 0,
+        memoryWrites: 0,
+        memoryWritten: false,
+        memoryReason: 'low-confidence-needs-confirmation',
+        pendingCount: 1,
+        pendingChars: 8,
+        pendingExposesText: false,
+        bypassRejected: true,
+        sends: 0,
+        storeEntries: 0,
+      },
+      actual: {
+        ok: pending.ok === true,
+        decision: pending.decision ?? '',
+        chatEntries: chats.length,
+        memoryWrites: writes.length,
+        memoryWritten: pending.memory?.written === true,
+        memoryReason: pending.memory?.reason ?? '',
+        pendingCount: pendingRows.length,
+        pendingChars: pendingRows[0]?.chars ?? -1,
+        pendingExposesText: Object.hasOwn(pendingRows[0] ?? {}, 'text'),
+        bypassRejected: pending.decision === 'needs-confirmation',
+        sends: harness.bot.deliveries.length,
+        storeEntries: store.list().length,
+      },
+    });
+
+    const confirmed = track(await runtime.confirm(pending.pending?.id));
+    const afterConfirmRows = runtime.listPending();
+
+    harness.step({
+      title: '确认后：转写才进聊天，记忆只写一次',
+      input: {
+        kind: 'audio-confirmation',
+        items: [{ text: 'confirm pending transcript once', userId: VISITOR }],
+        note: '只调用一次 confirm(id)；确认凭据是运行时返回的待确认 id，不写进证据',
+      },
+      expected: {
+        ok: true,
+        decision: 'chat',
+        chatText: transcriptText,
+        chatSource: 'asr-confirmed',
+        chatEntries: 1,
+        memoryWrites: 1,
+        memoryWritten: true,
+        memoryReason: 'written',
+        writeSource: 'asr-confirmed',
+        pendingCount: 0,
+        sends: 0,
+        storeEntries: 0,
+      },
+      actual: {
+        ok: confirmed.ok === true,
+        decision: confirmed.decision ?? '',
+        chatText: chats[0]?.text ?? '',
+        chatSource: chats[0]?.source ?? '',
+        chatEntries: chats.length,
+        memoryWrites: writes.length,
+        memoryWritten: confirmed.memory?.written === true,
+        memoryReason: confirmed.memory?.reason ?? '',
+        writeSource: writes[0]?.source ?? '',
+        pendingCount: afterConfirmRows.length,
+        sends: harness.bot.deliveries.length,
+        storeEntries: store.list().length,
+      },
+    });
+
+    const again = track(await runtime.confirm(pending.pending?.id));
+
+    harness.step({
+      title: '重复确认：同一条转写不会再进聊天、不会再写记忆',
+      input: {
+        kind: 'audio-confirmation',
+        items: [{ text: 'repeat the same confirmation id', userId: VISITOR }],
+        note: '用同一个 id 再确认一次；只允许一次消费',
+      },
+      expected: {
+        ok: false,
+        code: 'confirm-not-found',
+        decision: 'text-fallback',
+        chatEntries: 1,
+        memoryWrites: 1,
+        pendingCount: 0,
+        sends: 0,
+        storeEntries: 0,
+      },
+      actual: {
+        ok: again.ok === true,
+        code: again.error?.code ?? '',
+        decision: again.decision ?? '',
+        chatEntries: chats.length,
+        memoryWrites: writes.length,
+        pendingCount: runtime.listPending().length,
+        sends: harness.bot.deliveries.length,
+        storeEntries: store.list().length,
+      },
+    });
+  } finally {
+    await runtime.dispose();
+  }
+
+  return {
+    modules: ['media/voice-runtime.js#createVoiceRuntime', 'media/offline-stub.js', 'media/store.js'],
+    limitation: 'voice-runtime-synthetic-asr-memory-port',
+    note: '合成测试：offline-asr-stub + 内存记忆端口 + 临时媒体存储；'
+      + '不接真实 ASR / 供应商，不发送任何消息。',
+  };
+}
+
 /* ═══════════════ E-01 未知工具 ═══════════════ */
 
 /** E-01：未知工具名一律 unknown-tool，不执行、不落审计（名字不可归属）。 */
@@ -2510,6 +2694,219 @@ async function runE04(harness) {
   return { modules: ['tools/registry.js'], limitation: 'high-risk-stub-requires-U3-to-enable' };
 }
 
+/* ═══════════════ E-05 工具审计脱敏（宿主桥接） ═══════════════ */
+
+/**
+ * E-05：公开 createToolHostBridge() 的审计边界——审计事件只留工具名、风险、结果码、
+ * 确认状态、短摘要与关联标识；不含参数正文、异常原文或确认凭据（actionId / sessionKey）。
+ *
+ * 合成测试：宿主显式注入的纯内存假工具 + 固定 actionId/sessionKey；不接真实设备、
+ * 账号、网络或模型工具。
+ */
+async function runE05(harness) {
+  const BODY = 'E05-SYNTHETIC-ARG-BODY';
+  const EXCEPTION = 'E05-SYNTHETIC-EXCEPTION-TEXT';
+  const SESSION = 'e05-synthetic-session-key';
+  let confirmRuns = 0;
+  let actionSeq = 0;
+
+  const schema = {
+    type: 'object',
+    additionalProperties: false,
+    required: ['text'],
+    properties: { text: { type: 'string', minLength: 1, maxLength: 80 } },
+  };
+  const bridge = createToolHostBridge({
+    enabled: true,
+    tools: [
+      {
+        name: 'demo_e05_read',
+        description: '演示：handler 抛错的只读假工具（纯内存）',
+        parameters: schema,
+        risk: 'read-only',
+        permissions: [],
+        timeoutMs: 1000,
+        failurePolicy: 'stop',
+        compensate: null,
+        schedulable: false,
+        auditFields: ['trigger', 'durationMs', 'argsDigest'],
+        handler() {
+          throw new Error(EXCEPTION + ' ' + BODY);
+        },
+      },
+      {
+        name: 'demo_e05_confirm',
+        description: '演示：需要确认的假工具（纯内存）',
+        parameters: schema,
+        risk: 'confirm',
+        permissions: [],
+        timeoutMs: 1000,
+        failurePolicy: 'stop',
+        compensate: null,
+        schedulable: false,
+        auditFields: ['argsDigest'],
+        handler() {
+          confirmRuns += 1;
+          return { done: true };
+        },
+      },
+    ],
+    permissions: [],
+    now: () => harness.now(),
+    createActionId: () => 'e05-act-' + (actionSeq += 1),
+  });
+
+  /* ── ① 异常路径：审计只留 handler-failed 与摘要 ── */
+  const read = await bridge.execute('demo_e05_read', { text: BODY }, {});
+  const auditAfterRead = bridge.audit();
+  const readDigests = auditAfterRead
+    .filter((entry) => entry.event === 'execute')
+    .map((entry) => entry.argsDigest)
+    .filter((value) => typeof value === 'string');
+
+  harness.step({
+    title: '异常路径：审计只留 handler-failed 与参数摘要，不含参数正文/异常原文',
+    input: {
+      kind: 'tool-call',
+      items: [{ text: 'demo_e05_read', userId: 'system' }],
+      note: '合成假工具的 handler 抛出含哨兵正文的异常；只读审计快照',
+    },
+    tools: [{ name: 'demo_e05_read', ok: read.ok === true, code: read.code, policy: 'read-only' }],
+    expected: {
+      readOk: false,
+      readCode: 'handler-failed',
+      auditEvents: 'execute',
+      auditCode: 'handler-failed',
+      digestCount: 1,
+      digestShape: true,
+      correlationPrefixed: true,
+      hasActionIdField: false,
+      hasArgsField: false,
+      leakedBody: false,
+      leakedException: false,
+      leakedResult: false,
+    },
+    actual: {
+      readOk: read.ok === true,
+      readCode: read.code ?? '',
+      auditEvents: auditAfterRead.map((entry) => entry.event).join('|'),
+      auditCode: auditAfterRead[0]?.code ?? '',
+      digestCount: readDigests.length,
+      digestShape: readDigests.every((value) => /^[0-9a-f]{16}$/u.test(value)),
+      correlationPrefixed: auditAfterRead.every((entry) => typeof entry.correlationId === 'string'
+        && entry.correlationId.startsWith('c-')),
+      hasActionIdField: auditAfterRead.some((entry) => Object.hasOwn(entry, 'actionId')),
+      hasArgsField: auditAfterRead.some((entry) => Object.hasOwn(entry, 'args') || Object.hasOwn(entry, 'text')),
+      leakedBody: JSON.stringify(auditAfterRead).includes(BODY),
+      leakedException: JSON.stringify(auditAfterRead).includes(EXCEPTION),
+      leakedResult: JSON.stringify(read).includes(BODY) || JSON.stringify(read).includes(EXCEPTION),
+    },
+  });
+
+  /* ── ② 确认流程：请求/批准/执行/复用后整条审计仍脱敏 ── */
+  const modelCall = await bridge.model.call('demo_e05_confirm', { text: BODY });
+  const request = bridge.requestConfirmation(
+    'demo_e05_confirm',
+    { text: BODY },
+    { sessionKey: SESSION },
+  );
+  const pending = await bridge.execute(
+    'demo_e05_confirm',
+    { text: BODY },
+    { sessionKey: SESSION, actionId: request.actionId },
+  );
+  const approved = bridge.decideConfirmation(request.actionId, 'approve', { sessionKey: SESSION });
+  const ran = await bridge.execute(
+    'demo_e05_confirm',
+    { text: BODY },
+    { sessionKey: SESSION, actionId: request.actionId },
+  );
+  const reused = await bridge.execute(
+    'demo_e05_confirm',
+    { text: BODY },
+    { sessionKey: SESSION, actionId: request.actionId },
+  );
+
+  const audit = bridge.audit();
+  const executeEntries = audit.filter((entry) => entry.event === 'execute');
+  const digests = executeEntries
+    .map((entry) => entry.argsDigest)
+    .filter((value) => typeof value === 'string');
+  const auditText = JSON.stringify(audit);
+  const allowedKeys = new Set([
+    'seq', 'event', 'tool', 'risk', 'at', 'code', 'correlationId', 'confirmation',
+    'trigger', 'durationMs', 'argsDigest',
+  ]);
+
+  harness.step({
+    title: '确认流程：审计不含参数正文、异常原文、actionId 或 sessionKey',
+    input: {
+      kind: 'tool-call',
+      items: [{ text: 'demo_e05_confirm', userId: 'system' }],
+      note: '模型侧调用 → 宿主请求 → 待批执行 → 批准 → 执行 → 复用；'
+        + '正文/异常/凭据都是合成哨兵串，只读审计与结果',
+    },
+    tools: [
+      {
+        name: 'demo_e05_confirm',
+        ok: ran.ok === true,
+        code: ran.ok === true ? 'ok' : ran.code,
+        policy: 'confirm',
+      },
+    ],
+    expected: {
+      modelCall: 'confirmation-required',
+      requestOk: true,
+      requestStatus: 'pending',
+      pending: 'confirmation-pending',
+      approved: true,
+      approvedStatus: 'approved',
+      executed: 'ok',
+      reuse: 'confirmation-used',
+      handlerRuns: 1,
+      auditEvents: 'execute|execute|confirmation-request|execute|confirmation-decision|execute|execute',
+      auditConfirmations: 'not-required|missing|pending|approved|consumed',
+      digestCount: 5,
+      digestShape: true,
+      correlationPrefixed: true,
+      safeKeysOnly: true,
+      leakedBody: false,
+      leakedException: false,
+      leakedActionId: false,
+      leakedSessionKey: false,
+    },
+    actual: {
+      modelCall: modelCall.code ?? '',
+      requestOk: request.ok === true,
+      requestStatus: request.status ?? '',
+      pending: pending.code ?? '',
+      approved: approved.ok === true,
+      approvedStatus: approved.status ?? '',
+      executed: ran.ok === true ? 'ok' : (ran.code ?? ''),
+      reuse: reused.code ?? '',
+      handlerRuns: confirmRuns,
+      auditEvents: audit.map((entry) => entry.event).join('|'),
+      auditConfirmations: executeEntries.map((entry) => entry.confirmation).join('|'),
+      digestCount: digests.length,
+      digestShape: digests.every((value) => /^[0-9a-f]{16}$/u.test(value)),
+      correlationPrefixed: audit.every((entry) => typeof entry.correlationId === 'string'
+        && entry.correlationId.startsWith('c-')),
+      safeKeysOnly: audit.every((entry) => Object.keys(entry).every((key) => allowedKeys.has(key))),
+      leakedBody: auditText.includes(BODY),
+      leakedException: auditText.includes(EXCEPTION),
+      leakedActionId: auditText.includes(request.actionId),
+      leakedSessionKey: auditText.includes(SESSION),
+    },
+  });
+
+  return {
+    modules: ['tools/host-bridge.js#createToolHostBridge', 'tools/registry.js'],
+    limitation: 'tool-host-bridge-synthetic-fake-tools',
+    note: '合成测试：宿主显式注入的纯内存假工具 + 固定 actionId/sessionKey；'
+      + '不接真实设备、账号、网络或模型工具。',
+  };
+}
+
 /* ══════════════════════ 场景表 ══════════════════════ */
 
 /**
@@ -2534,18 +2931,10 @@ const NOT_COVERED = Object.freeze(Object.fromEntries([
 }])));
 
 /**
- * D/E 未覆盖项：仍显式保留为 not-covered，不用 X-03/X-04 的增补旁证冒充 D/E 验收。
- * reason 是闭合码；requires 说明还缺什么。
+ * D/E 未覆盖项：D-05 仍显式保留为 not-covered——本 checkout 没有宿主附件入口，
+ * 不用 X-03/X-04 的增补旁证冒充 D/E 验收。reason 是闭合码；requires 说明还缺什么。
  */
 const DE_NOT_COVERED = Object.freeze({
-  'D-04': Object.freeze({
-    id: 'D-04',
-    gate: 'extra',
-    status: 'not-covered',
-    title: '未覆盖：D-04 低置信度（当前只有 X-04 增补旁证）',
-    reason: 'extra-only-in-X-04',
-    requires: '独立的 D-04 低置信度验收；X-04 只是增补旁证，未提升为 D-04',
-  }),
   'D-05': Object.freeze({
     id: 'D-05',
     gate: 'extra',
@@ -2553,14 +2942,6 @@ const DE_NOT_COVERED = Object.freeze({
     title: '未覆盖：D-05 图片/文件元数据（缺宿主附件入口）',
     reason: 'requires-host-attachment-path',
     requires: '附件元数据入口（本 checkout 没有宿主附件路径）',
-  }),
-  'E-05': Object.freeze({
-    id: 'E-05',
-    gate: 'extra',
-    status: 'not-covered',
-    title: '未覆盖：E-05 审计脱敏（当前只有 X-03 增补旁证）',
-    reason: 'extra-only-in-X-03',
-    requires: '独立的 E-05 审计脱敏验收；X-03 只是增补旁证，未提升为 E-05',
   }),
 });
 
@@ -2596,18 +2977,18 @@ export const SCENARIOS = Object.freeze([
   { id: 'X-04', aliases: ['media-pipeline-offline'], gate: 'extra', status: 'covered', title: 'X-04（增补）离线媒体：低置信度不写记忆、临时音频删除审计、TTS 失败保留文字', run: runX04 },
   { id: 'X-05', aliases: ['presence-qq-runtime'], gate: 'extra', status: 'covered', title: 'X-05（增补）离线 QQ presence runtime：白名单闸门、唯一 owner 欢迎、状态文件白名单、重启冷却/台账、私聊不自指、群聊不触发', run: runX05 },
   { id: 'X-06', aliases: ['onebot-reconnect'], gate: 'extra', status: 'covered', title: 'X-06（增补）通用 CLI 的 OneBot 重连与去重', run: runX06 },
-  // D-01…D-03 / E-01…E-04 是执行计划 §9.3 的独立验收项；与 X-01/X-04 的增补旁证区分，不复用同一 ID。
+  // D-01…D-04 / E-01…E-05 是执行计划 §9.3 的独立验收项；与 X-01/X-03/X-04 的增补旁证区分，不复用同一 ID。
   { id: 'D-01', aliases: ['asr-success'], gate: 'extra', status: 'covered', title: 'D-01 离线 ASR 成功（桩）：转写/置信度/元数据；无 memory port 不写长期记忆', run: runD01 },
   { id: 'D-02', aliases: ['asr-failure'], gate: 'extra', status: 'covered', title: 'D-02 ASR 失败（桩）：asr-failed + ask-repeat，保留元数据', run: runD02 },
   { id: 'D-03', aliases: ['tts-failure'], gate: 'extra', status: 'covered', title: 'D-03 TTS 失败（桩）：显式失败与超时都保留文字回退', run: runD03 },
-  DE_NOT_COVERED['D-04'],
+  { id: 'D-04', aliases: ['voice-low-confidence-confirm'], gate: 'extra', status: 'covered', title: 'D-04 低置信度语音：确认前不进聊天/记忆，确认后只处理一次（合成 ASR + 内存记忆端口）', run: runD04 },
   DE_NOT_COVERED['D-05'],
-  // E-01…E-04 按执行计划 §9.3 的语义：未知工具 / 需确认 / 超时 / 高风险。
+  // E-01…E-05 按执行计划 §9.3 的语义：未知工具 / 需确认 / 超时 / 高风险 / 审计脱敏。
   { id: 'E-01', aliases: ['unknown-tool'], gate: 'extra', status: 'covered', title: 'E-01 未知工具：unknown-tool，不执行、不落审计', run: runE01 },
   { id: 'E-02', aliases: ['confirm-reject'], gate: 'extra', status: 'covered', title: 'E-02 需确认工具：拒绝后不重试，handler 不执行', run: runE02 },
   { id: 'E-03', aliases: ['tool-timeout'], gate: 'extra', status: 'covered', title: 'E-03 工具超时：结构化 timeout + 审计，不伪成功', run: runE03 },
   { id: 'E-04', aliases: ['high-risk-tool'], gate: 'extra', status: 'covered', title: 'E-04 高风险工具：默认 risk-not-allowed，永不执行', run: runE04 },
-  DE_NOT_COVERED['E-05'],
+  { id: 'E-05', aliases: ['tool-audit-redaction'], gate: 'extra', status: 'covered', title: 'E-05 工具审计脱敏：不含参数正文、异常原文或确认凭据（合成假工具）', run: runE05 },
 ].map((scenario) => Object.freeze(scenario)));
 
 /** 取场景表（默认内置；测试可注入自己的表）。 */

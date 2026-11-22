@@ -24,8 +24,9 @@
  *      0 次生成）；同一装配用一条明确提醒作正对照（真的新建并回复任务 ID）。
  *  14. B-08 消息与到期提醒同时发生：回复在途时提醒只 claim 入队不发送；放行后
  *      回复先发、提醒后发各一次并落终态；终态再派发不重发（只证明 CLI 离线层）。
- *  15. D/E 离线契约：D-01…D-03（ASR/TTS 桩）与 E-01…E-04（fake tool）；
- *      D-04/D-05/E-05 仍显式 not-covered，不用增补旁证冒充 D/E 验收。
+ *  15. D/E 离线契约：D-01…D-04（ASR/TTS 桩 + 语音运行入口）与
+ *      E-01…E-05（fake tool + 宿主桥接）；D-05 仍显式 not-covered（缺宿主附件入口），
+ *      不用增补旁证冒充 D/E 验收。
  *
  * 全程离线：只用临时目录与内存桩，不联网、不调模型、不读写仓库 data/。
  */
@@ -923,7 +924,7 @@ test('场景表：B 门分母是 18，未覆盖 id 与 covered id 不重叠', ()
   // 增补场景只加证据，不改 B 门分母。
   for (const extra of [
     'X-01', 'X-02', 'X-03', 'X-04', 'X-05', 'X-06',
-    'D-01', 'D-02', 'D-03', 'E-01', 'E-02', 'E-03', 'E-04',
+    'D-01', 'D-02', 'D-03', 'D-04', 'E-01', 'E-02', 'E-03', 'E-04', 'E-05',
   ]) {
     assert.ok(!bGateIds().includes(extra), extra + ' 不该进 B 门分母');
     assert.ok(covered.includes(extra), extra + ' 应作为增补场景被执行');
@@ -937,21 +938,25 @@ test('场景表：B 门分母是 18，未覆盖 id 与 covered id 不重叠', ()
   assert.deepEqual(notCoveredCIds(), ['C-01', 'C-02']);
   assert.equal(
     listScenarios().filter((scenario) => scenario.gate === 'extra' && scenario.status === 'covered').length,
-    13,
+    15,
   );
-  // covered 总数 = 11 个 B 门 + 6 个 C 门 + 13 个增补；
-  // not-covered 是 7 个 B 门 + 2 个 C 门 + 3 个 D/E。
-  assert.equal(covered.length, 30);
+  // covered 总数 = 11 个 B 门 + 6 个 C 门 + 15 个增补；
+  // not-covered 是 7 个 B 门 + 2 个 C 门 + 1 个 D/E（D-05）。
+  assert.equal(covered.length, 32);
   assert.equal(listScenarios().length, 42);
   // 缺失的宿主 / QQ 集成路径在本 checkout 里确实不存在：用场景表登记证明，
   // 不断言任何私有目录名（公开 fork 不依赖私有宿主路径）。
   assert.equal(findScenario('B-03').status, 'not-covered');
-  for (const id of ['D-04', 'D-05', 'E-05']) {
+  // D-04/E-05 已有独立可执行证据；D-05 仍缺宿主附件入口，不能用桩冒充。
+  for (const id of ['D-04', 'E-05']) {
     const scenario = findScenario(id);
-    assert.equal(scenario.status, 'not-covered', id + ' 应保留为未覆盖');
-    assert.equal(scenario.run, undefined, id + ' 不能用桩冒充验收');
-    assert.ok(scenario.reason.length > 0);
+    assert.equal(scenario.status, 'covered', id + ' 应有独立可执行证据');
+    assert.equal(typeof scenario.run, 'function', id + ' 缺少 run');
   }
+  const d05 = findScenario('D-05');
+  assert.equal(d05.status, 'not-covered', 'D-05 应保留为未覆盖');
+  assert.equal(d05.run, undefined, 'D-05 不能用桩冒充验收');
+  assert.ok(d05.reason.length > 0);
 });
 
 test('场景表：每个 covered 场景都有可执行的 run，not-covered 只有说明', () => {
@@ -1077,7 +1082,7 @@ test('runner：默认执行整表，退出码 0，覆盖分母与未覆盖列表
   // summary.passed 包括 C 与增补场景，B 门通过数必须单独可读。
   assert.equal(report.summary.bGatePassed, 11);
   assert.equal(report.summary.cGatePassed, 6);
-  assert.equal(report.summary.passed - report.summary.bGatePassed, 19);
+  assert.equal(report.summary.passed - report.summary.bGatePassed, 21);
   assert.equal(report.summary.coverageDenominator, 18);
   assert.equal(report.summary.cGateCoverageDenominator, 8);
   assert.equal(report.summary.completeBGate, false, 'completeBGate 必须保持 false');
@@ -1091,7 +1096,7 @@ test('runner：默认执行整表，退出码 0，覆盖分母与未覆盖列表
   assert.deepEqual(report.coverage.extraExecutedIds, [
     'C-03', 'C-04', 'C-05', 'C-07', 'C-08', 'C-09',
     'X-01', 'X-02', 'X-03', 'X-04', 'X-05', 'X-06',
-    'D-01', 'D-02', 'D-03', 'E-01', 'E-02', 'E-03', 'E-04',
+    'D-01', 'D-02', 'D-03', 'D-04', 'E-01', 'E-02', 'E-03', 'E-04', 'E-05',
   ]);
   for (const extra of report.coverage.extraExecutedIds) {
     assert.ok(!report.coverage.missingBIds.includes(extra), extra + ' 混进了 missingBIds');
@@ -1107,10 +1112,10 @@ test('runner：默认执行整表，退出码 0，覆盖分母与未覆盖列表
   assert.ok(report.coverage.missingBIds.includes('B-03'));
   assert.deepEqual(report.coverage.groupIds, ['C-01', 'C-02']);
   assert.equal(report.summary.notCovered, report.summary.total - report.summary.executed);
-  // 42 项 = 18 个 B 门 + 8 个 C 门 + 13 个增补 + 3 个 D/E 未覆盖。
+  // 42 项 = 18 个 B 门 + 8 个 C 门 + 15 个增补 + 1 个 D/E 未覆盖（D-05）。
   assert.equal(report.summary.total, 42);
-  assert.equal(report.summary.executed, 30);
-  assert.equal(report.summary.notCovered, 12);
+  assert.equal(report.summary.executed, 32);
+  assert.equal(report.summary.notCovered, 10);
   // 生成时间来自虚拟时钟：必须显式标注来源，避免被当成真实墙钟。
   assert.equal(report.generatedAtSource, 'harness-virtual-clock');
   assert.equal(report.generatedAt, '2026-01-01T00:00:00.000Z');
@@ -2114,12 +2119,133 @@ test('E-04：高风险工具默认 risk-not-allowed，handler 不执行', async 
   }
 });
 
-test('D/E 未覆盖项仍明确保留：D-04/D-05/E-05 没有 run', () => {
-  for (const id of ['D-04', 'D-05', 'E-05']) {
+test('D-04：低置信度确认前不进聊天/记忆，确认后只处理一次', async () => {
+  const harness = createHarness();
+  try {
+    const result = await runScenario('D-04', { harness });
+    assert.equal(result.status, 'pass');
+    assert.equal(result.steps.length, 3);
+    const [pending, confirmed, again] = result.steps;
+
+    // ① 确认前：只挂待确认；聊天为空、记忆零写入；入参 confirmed 不能绕过。
+    assert.equal(pending.actual.ok, true);
+    assert.equal(pending.actual.decision, 'needs-confirmation');
+    assert.equal(pending.actual.chatEntries, 0);
+    assert.equal(pending.actual.memoryWrites, 0);
+    assert.equal(pending.actual.memoryWritten, false);
+    assert.equal(pending.actual.memoryReason, 'low-confidence-needs-confirmation');
+    assert.equal(pending.actual.pendingCount, 1);
+    assert.equal(pending.actual.pendingChars, 8);
+    assert.equal(pending.actual.pendingExposesText, false);
+    assert.equal(pending.actual.bypassRejected, true);
+    assert.equal(pending.actual.sends, 0);
+    assert.equal(pending.actual.storeEntries, 0);
+
+    // ② 确认后：才进聊天，记忆只写一次。
+    assert.equal(confirmed.actual.ok, true);
+    assert.equal(confirmed.actual.decision, 'chat');
+    assert.equal(confirmed.actual.chatText, '合成低置信度转写');
+    assert.equal(confirmed.actual.chatSource, 'asr-confirmed');
+    assert.equal(confirmed.actual.chatEntries, 1);
+    assert.equal(confirmed.actual.memoryWrites, 1);
+    assert.equal(confirmed.actual.memoryWritten, true);
+    assert.equal(confirmed.actual.memoryReason, 'written');
+    assert.equal(confirmed.actual.writeSource, 'asr-confirmed');
+    assert.equal(confirmed.actual.pendingCount, 0);
+    assert.equal(confirmed.actual.sends, 0);
+    assert.equal(confirmed.actual.storeEntries, 0);
+
+    // ③ 重复确认：同一条转写不会再次处理。
+    assert.equal(again.actual.ok, false);
+    assert.equal(again.actual.code, 'confirm-not-found');
+    assert.equal(again.actual.decision, 'text-fallback');
+    assert.equal(again.actual.chatEntries, 1);
+    assert.equal(again.actual.memoryWrites, 1);
+    assert.equal(again.actual.pendingCount, 0);
+    assert.equal(again.actual.sends, 0);
+    assert.equal(again.actual.storeEntries, 0);
+
+    // 证据里不能出现随机待确认 id 或合成音频正文（否则报告不再可复现）。
+    const evidence = JSON.stringify(result.steps);
+    assert.equal(/[0-9a-f]{8}-[0-9a-f]{4}/u.test(evidence), false, '待确认 id 进了证据');
+    assert.equal(evidence.includes('d04-synthetic-audio-bytes'), false, '音频正文进了证据');
+    assert.deepEqual(result.artifacts.tempFiles, []);
+    assert.equal(result.artifacts.limitation, 'voice-runtime-synthetic-asr-memory-port');
+    assert.match(result.artifacts.note, /合成测试/u);
+  } finally {
+    harness.cleanup();
+  }
+});
+
+test('E-05：宿主桥接审计不含参数正文、异常原文或确认凭据', async () => {
+  const harness = createHarness();
+  try {
+    const result = await runScenario('E-05', { harness });
+    assert.equal(result.status, 'pass');
+    assert.equal(result.steps.length, 2);
+    const [exceptionStep, confirmStep] = result.steps;
+
+    // ① 异常路径：只留 handler-failed、参数摘要与关联标识。
+    assert.equal(exceptionStep.actual.readOk, false);
+    assert.equal(exceptionStep.actual.readCode, 'handler-failed');
+    assert.equal(exceptionStep.actual.auditEvents, 'execute');
+    assert.equal(exceptionStep.actual.auditCode, 'handler-failed');
+    assert.equal(exceptionStep.actual.digestCount, 1);
+    assert.equal(exceptionStep.actual.digestShape, true);
+    assert.equal(exceptionStep.actual.correlationPrefixed, true);
+    assert.equal(exceptionStep.actual.hasActionIdField, false);
+    assert.equal(exceptionStep.actual.hasArgsField, false);
+    assert.equal(exceptionStep.actual.leakedBody, false);
+    assert.equal(exceptionStep.actual.leakedException, false);
+    assert.equal(exceptionStep.actual.leakedResult, false);
+
+    // ② 确认流程：请求/批准/执行/复用之后，整条审计仍然脱敏。
+    assert.equal(confirmStep.actual.modelCall, 'confirmation-required');
+    assert.equal(confirmStep.actual.requestOk, true);
+    assert.equal(confirmStep.actual.requestStatus, 'pending');
+    assert.equal(confirmStep.actual.pending, 'confirmation-pending');
+    assert.equal(confirmStep.actual.approved, true);
+    assert.equal(confirmStep.actual.approvedStatus, 'approved');
+    assert.equal(confirmStep.actual.executed, 'ok');
+    assert.equal(confirmStep.actual.reuse, 'confirmation-used');
+    assert.equal(confirmStep.actual.handlerRuns, 1);
+    assert.equal(
+      confirmStep.actual.auditEvents,
+      'execute|execute|confirmation-request|execute|confirmation-decision|execute|execute',
+    );
+    assert.equal(confirmStep.actual.auditConfirmations, 'not-required|missing|pending|approved|consumed');
+    assert.equal(confirmStep.actual.digestCount, 5);
+    assert.equal(confirmStep.actual.digestShape, true);
+    assert.equal(confirmStep.actual.correlationPrefixed, true);
+    assert.equal(confirmStep.actual.safeKeysOnly, true);
+    assert.equal(confirmStep.actual.leakedBody, false);
+    assert.equal(confirmStep.actual.leakedException, false);
+    assert.equal(confirmStep.actual.leakedActionId, false);
+    assert.equal(confirmStep.actual.leakedSessionKey, false);
+
+    // 证据本身也不能夹带这些哨兵串（只留布尔结论）。
+    const evidence = JSON.stringify(result.steps);
+    assert.equal(evidence.includes('E05-SYNTHETIC-ARG-BODY'), false, '参数正文进了证据');
+    assert.equal(evidence.includes('E05-SYNTHETIC-EXCEPTION-TEXT'), false, '异常原文进了证据');
+    assert.equal(evidence.includes('e05-act-1'), false, '确认凭据进了证据');
+    assert.equal(evidence.includes('e05-synthetic-session-key'), false, '会话凭据进了证据');
+    assert.deepEqual(result.artifacts.tempFiles, []);
+    assert.equal(result.artifacts.limitation, 'tool-host-bridge-synthetic-fake-tools');
+    assert.match(result.artifacts.note, /合成测试/u);
+  } finally {
+    harness.cleanup();
+  }
+});
+
+test('D-05 仍明确保留为未覆盖；D-04/E-05 已有独立 run', () => {
+  const d05 = findScenario('D-05');
+  assert.equal(d05.status, 'not-covered', 'D-05 应保留为未覆盖');
+  assert.equal(d05.run, undefined, 'D-05 不能用桩冒充验收');
+  assert.ok(d05.reason.length > 0);
+  for (const id of ['D-04', 'E-05']) {
     const scenario = findScenario(id);
-    assert.equal(scenario.status, 'not-covered', id + ' 应保留为未覆盖');
-    assert.equal(scenario.run, undefined, id + ' 不能用桩冒充验收');
-    assert.ok(scenario.reason.length > 0);
+    assert.equal(scenario.status, 'covered', id + ' 应有独立可执行证据');
+    assert.equal(typeof scenario.run, 'function', id + ' 缺少 run');
   }
 });
 
