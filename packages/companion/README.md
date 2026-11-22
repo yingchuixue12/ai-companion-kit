@@ -234,6 +234,53 @@ npm start         # 真跑
 唤醒时，把「这个人的账」+「最近 20 轮对话」一起塞进提示词。
 所以它既知道**长期的事**（常熬夜、养猫），也知道**刚才发生了什么**。
 
+### 记忆检索（默认关，可选）
+
+提示词里的那一块记忆，默认还是 `renderPerson` 的整本账。想让它换成
+**结构化检索**（已合入的两个适配器，都是纯本地、只读）时，在 `config.json` 里加：
+
+```json
+"memory": {
+  "retrieval": {
+    "enabled": true,
+    "mode": "tail-window",
+    "maxRecords": 20,
+    "maxChars": 5000,
+    "minConfidence": 0,
+    "includeUnverified": true,
+    "allowUnattributed": false
+  }
+}
+```
+
+- `mode` 只有两个值：`tail-window`（最近窗口，不按查询词打分）和 `lexical`
+  （本地的词面重叠打分，CJK 二元组 + 空白切分，没有 embedding、不联网）。
+  写错的值会回退 `tail-window`。
+- **默认 `false`**：不打开就完全不走检索，请求体与以前逐字节一致。
+- **只读**：检索只调 `dump()` / `recentTurns()`，不写账本、不迁移 v1→v2、
+  不创建 `data/memory/`、不落任何真实记忆。
+- **隐私**：没有主体（群聊多发送者）就不检索；只返回本人的记录；
+  被删除 / 隔离 / 替代 / 脱敏 / 受限 / 缺出处的记录一律不渲染；
+  适配器明确拒绝时给空块，**不退回**别人的记忆。
+- **预算**：单条折叠空白后 ≤160 字，整块 ≤`maxChars`（默认 5000，与记忆槽上限同源）。
+  按整条贪心取，放不下就停，绝不把半句丢给 `Role.build` 兜底裁剪。
+- **降级**：启用后，检索故障或没有可用记录时，本轮省略长期记忆，仍可正常回复。
+  这样不会绕开检索的隐私和预算限制。
+
+单独的检索入口（不经配置，直接给 `Brain`）：
+
+```js
+import { Brain } from 'ai-companion';
+const brain = new Brain({
+  apiKey, role, memory,
+  memoryBlocks: async ({ key, userId, text }) =>
+    renderAllowedMemory({ key, userId, text }),
+});
+```
+
+`Brain` 只认 `memoryBlocks` 这个不透明钩子：它自己不读账本、不做过滤，
+检索、隐私与预算全在提供者那一侧。`memoryBlocks` 缺省为 `null`。
+
 ### Waker · 潜水是怎么实现的
 
 - `setConfig(key, {...})` 给每个会话单独配规则

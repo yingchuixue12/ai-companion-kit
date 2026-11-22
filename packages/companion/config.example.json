@@ -51,6 +51,18 @@
   },
   "// 7": "=== 数据存哪（账本 + 对话流）===",
   "dataDir": "data",
+  "// 7.1": "=== 记忆检索（默认关；打开只影响提示词里的记忆块，不迁移、不写盘、不联网）===",
+  "memory": {
+    "retrieval": {
+      "enabled": false,
+      "mode": "tail-window",
+      "maxRecords": 20,
+      "maxChars": 5000,
+      "minConfidence": 0,
+      "includeUnverified": true,
+      "allowUnattributed": false
+    }
+  },
   "// 8": "=== 日记（她自己写）===",
   "diaryDir": "data/diary",
   "diaryMaxChars": 2000,

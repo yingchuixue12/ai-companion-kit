@@ -19,6 +19,11 @@ import { planContextBudget } from './context-budget.js';
  */
 const RECENT_TURN_LIMIT = 20;
 
+/** 记忆块提供者只接受函数；其它值当作没接（保持接线前行为）。 */
+function resolveMemoryBlocks(provider) {
+  return typeof provider === 'function' ? provider : null;
+}
+
 /** 请求体超预算时抛出的错误：只带计数，不带任何正文 */
 function contextOverflow(maxInputChars, inputChars) {
   const error = new Error('输入超出上下文预算：请求体 ' + inputChars + ' 字符 > 上限 ' + maxInputChars);
@@ -38,8 +43,12 @@ export class Brain {
    * @param {number}  [opts.maxInputChars] 序列化请求体长度上限，默认 24000（正安全整数）
    * @param {Role}    opts.role
    * @param {Memory}  opts.memory
+   * @param {Function|null} [opts.memoryBlocks] 可选的记忆块提供者（默认 null）：
+   *   `({ key, userId, text }) => string|null|Promise<string|null>`。
+   *   配置后独占记忆槽；空结果或错误均不读取旧账本。
+   *   Brain 自己不读账本、不做过滤策略：检索、隐私与预算都在提供者那一侧。
    */
-  constructor({ apiKey, baseUrl = 'https://api.deepseek.com/v1', model = 'deepseek-chat', timeoutMs = 120000, maxInputChars = 24000, role, memory }) {
+  constructor({ apiKey, baseUrl = 'https://api.deepseek.com/v1', model = 'deepseek-chat', timeoutMs = 120000, maxInputChars = 24000, role, memory, memoryBlocks = null }) {
     if (!Number.isSafeInteger(maxInputChars) || maxInputChars <= 0) {
       throw new TypeError('maxInputChars 必须是正安全整数，收到：' + String(maxInputChars));
     }
@@ -50,6 +59,22 @@ export class Brain {
     this.maxInputChars = maxInputChars;
     this.role = role || new Role({ cardPath: 'role.md' });
     this.memory = memory || new Memory({ dir: './data' });
+    this.memoryBlocks = resolveMemoryBlocks(memoryBlocks);
+  }
+
+  /**
+   * 可选记忆块的取值：没接提供者、返回空值或抛错都返回 null（沿用旧路径）。
+   * null 表示未配置；空字符串表示本轮没有可以使用的记忆。
+   */
+  async #retrievedMemoryBlock({ key, userId, text }) {
+    if (!this.memoryBlocks) return null;
+    let block;
+    try {
+      block = await this.memoryBlocks({ key, userId, text });
+    } catch {
+      return '';
+    }
+    return typeof block === 'string' && block.trim() ? block : '';
   }
 
   /**
@@ -71,7 +96,9 @@ export class Brain {
     const deferred = record === 'deferred';
     const shouldRecord = record && !deferred;
 
-    const memLine = this.memory.renderPerson(userId);
+    // 只有未启用检索才使用旧账本，避免绕过已启用的隐私或预算策略。
+    const retrieved = await this.#retrievedMemoryBlock({ key, userId, text });
+    const memLine = retrieved === null ? this.memory.renderPerson(userId) : retrieved;
     // 最近对话：能拿到结构化轮次就用它一次读盘同时给出整段文本与按整轮裁剪的能力；
     // 拿不到（只有 renderRecent 的注入 adapter / 自定义渲染）就照旧调用 renderRecent。
     const recentView = this.#recentRoundView(key);

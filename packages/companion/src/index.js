@@ -32,6 +32,11 @@ import { createPrivateTurnReplay } from './private-turn-replay.js';
 import { createReminderRuntime } from './reminder-runtime.js';
 import { createReminderCommands } from './reminder-commands.js';
 import { createPresenceQQHost } from './presence-qq-runtime.js';
+import {
+  createEntryMemoryRetriever,
+  normalizeRetrievalConfig,
+  retrieveMemoryForTurn,
+} from './memory/retrieval-entry.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -90,6 +95,11 @@ export function loadConfig(explicitPath, argv = process.argv) {
     },
 
     humanize: cfg.humanize || {},
+    // 结构化记忆检索（默认关；只吃已合入的 tail-window / lexical 适配器，
+    // 不迁移 v1、不发网络请求、不写真实记忆）
+    memory: {
+      retrieval: normalizeRetrievalConfig(cfg.memory?.retrieval),
+    },
     reminders: argv.includes('--reminders'),
     dryRun: argv.includes('--dry-run'),
   };
@@ -132,6 +142,41 @@ function configureReminderCommands(deps, cfg) {
     send: (userId, text) => deps?.bot?.sendPrivateText(userId, text),
     onError: () => { console.error('[提醒] 命令处理失败'); },
   });
+}
+
+// ── 记忆检索接线（默认关）────────────────────────────────────
+/**
+ * 给 Brain 造一个可选的记忆块提供者。
+ *
+ * - 配置没开 → 返回 null：Brain 完全跳过检索，走原来的 `renderPerson`；
+ * - 配置开了 → 每次调用现取适配器（tail-window / lexical 都是只读），
+ *   交给 `retrieveMemoryForTurn` 做请求、隐私兜底与预算渲染；
+ * - 拿不到块时返回空字符串，不读取旧账本、不写盘。
+ *
+ * 只读：适配器只调用 `dump()` / `recentTurns()` / `listRecords()`，
+ * 不碰 `remember` / `logTurn` / `touch`，也不迁移 v1→v2。
+ *
+ * @param {object} cfg
+ * @param {object} memory  Memory 实例
+ * @returns {null | ((input: {key: string, userId: string, text: string}) => Promise<string|null>)}
+ */
+export function buildMemoryBlocks(cfg, memory) {
+  const retrieval = normalizeRetrievalConfig(cfg?.memory?.retrieval);
+  if (!retrieval.enabled) return null;
+  return async ({ key, userId, text } = {}) => {
+    // 工厂只做"能不能用"的判断（关闭/账本不可读时返回 null），不读账本；
+    // 真正读账本在适配器的 retrieve() 里，失败按 T-3 返回 degraded。
+    // 意外错误由 Brain 侧转换为空记忆块。
+    const retriever = createEntryMemoryRetriever({ memory, config: retrieval });
+    const out = await retrieveMemoryForTurn({
+      retriever,
+      key,
+      userId,
+      text,
+      config: retrieval,
+    });
+    return out.memory;
+  };
 }
 
 /**
@@ -236,6 +281,9 @@ export async function main({ createBot, proc: injectedProc, process: injectedPro
   console.log('  主人      ' + (cfg.ownerIds.join(', ') || '（没配）'));
   console.log('  干跑      ' + (cfg.dryRun ? '是（不会真发）' : '否'));
   console.log('  提醒      ' + (cfg.reminders ? (cfg.dryRun ? '开（干跑不启动）' : '开') : '关'));
+  console.log('  记忆检索  ' + (cfg.memory.retrieval.enabled
+    ? cfg.memory.retrieval.mode + '（上限 ' + cfg.memory.retrieval.maxChars + ' 字）'
+    : '关'));
   console.log('');
 
   const memory = new Memory({ dir: cfg.dataDir });
@@ -251,7 +299,14 @@ export async function main({ createBot, proc: injectedProc, process: injectedPro
   if (argv.includes('--check')) { console.log('检查完毕。'); return; }
   if (!cfg.apiKey) console.log('⚠️ 没配 apiKey，模型调用会失败\n');
 
-  const brain = new Brain({ apiKey: cfg.apiKey, baseUrl: cfg.baseUrl, model: cfg.model, role, memory });
+  const brain = new Brain({
+    apiKey: cfg.apiKey,
+    baseUrl: cfg.baseUrl,
+    model: cfg.model,
+    role,
+    memory,
+    memoryBlocks: buildMemoryBlocks(cfg, memory),
+  });
   const human = new Humanizer(cfg.humanize);
   const waker = new Waker({
     names: cfg.names,
