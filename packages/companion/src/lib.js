@@ -48,3 +48,18 @@ export {
   VOICE_RUNTIME_ERROR,
 } from './media/voice-runtime.js';
 export { createToolHostBridge, formatToolHostOutcome } from './tools/host-bridge.js';
+/**
+ * Web 在场宿主接线（本机 presence 宿主入口）。
+ * 只做「活动/焦点/心跳 → 状态机 → 策略提示 → 宿主队列」这一条线，
+ * 不开 HTTP、不做认证、不画界面；enabled 必须显式为 true 才工作。
+ */
+export {
+  createPresenceWebHost,
+  PRESENCE_WEB_DEFAULT_MAX_MESSAGES,
+  PRESENCE_WEB_DIAGNOSTIC_CODES,
+  PRESENCE_WEB_RESULT_STATUSES,
+  PRESENCE_WEB_SIGNAL_FLAGS,
+  PRESENCE_WEB_STATE_FILE,
+  PRESENCE_WEB_STATE_TTL_MS,
+  PRESENCE_WEB_STATUSES,
+} from './presence/web-host.js';
