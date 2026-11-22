@@ -133,7 +133,7 @@ head('脱敏检查（不该出现的东西）');
 const PATTERNS = [
   [/\b\d{10,11}\b/, '疑似 QQ 号（10~11 位数字）'],
   [/sk-[a-zA-Z0-9]{20,}/, '疑似 API key'],
-  (/[A-Z]:\\\\?(Users|ai|qq-bridge|platform-tools|Comfy)/i, '疑似本机绝对路径'),
+  [/[A-Z]:\\\\?(Users|ai|qq-bridge|platform-tools|Comfy)/i, '疑似本机绝对路径'],
 ];
 const ALLOW = [
   'scripts/check.mjs',       // 本文件自己写了这些模式
@@ -146,9 +146,8 @@ for (const f of files) {
   if (ALLOW.includes(rel)) continue;
   const txt = fs.readFileSync(f, 'utf8');
   for (const [re, label] of PATTERNS) {
-    const m = txt.match(re);
-    if (m) {
-      wrn(rel + ' 命中「' + label + '」：' + m[0].slice(0, 40));
+    if (txt.match(re)) {
+      wrn(rel + ' 命中「' + label + '」');
       dirty++;
     }
   }
