@@ -12,6 +12,7 @@
 import { Memory } from './memory.js';
 import { Role, normalizeTaskReferences } from './role.js';
 import { planContextBudget } from './context-budget.js';
+import { planLayerQuotas } from './layer-quota.js';
 
 /**
  * 最近对话的请求上限：既是 `renderRecent` 的条数，也是按整轮裁剪时最多考虑的轮数。
@@ -21,6 +22,7 @@ const RECENT_TURN_LIMIT = 20;
 
 /** memory-budget 诊断事件的字段版本：字段增删都要改它，消费方据此判断兼容性。 */
 export const MEMORY_BUDGET_EVENT_VERSION = 1;
+const LAYER_QUOTA_EVENT_VERSION = 2;
 
 /**
  * 诊断里「被整块淘汰」的块名顺序：与 P-3 一致（recent → memory → situation → L6 任务引用），
@@ -76,10 +78,18 @@ export class Brain {
    *   只有本轮明确注入任务引用时才会出现 `taskReferences`，旧请求的字段与取值不变。
    *   回调失败（同步抛错或 reject）不影响本轮；不等待它完成，也不改网络/记忆行为。
    *   不接回调时行为与接线前完全一致。
+   * @param {number|null} [opts.systemBudgetChars=null] Optional P-4 target in UTF-16 units.
+   * Requires layered Role. Stable role and protocol remain intact; maxInputChars
+   * still controls dispatch. The memory-budget event includes quota counts when enabled.
    */
-  constructor({ apiKey, baseUrl = 'https://api.deepseek.com/v1', model = 'deepseek-chat', timeoutMs = 120000, maxInputChars = 24000, role, memory, memoryBlocks = null, onMemoryBudget = null }) {
+  constructor({ apiKey, baseUrl = 'https://api.deepseek.com/v1', model = 'deepseek-chat', timeoutMs = 120000, maxInputChars = 24000, role, memory, memoryBlocks = null, onMemoryBudget = null, systemBudgetChars = null }) {
     if (!Number.isSafeInteger(maxInputChars) || maxInputChars <= 0) {
       throw new TypeError('maxInputChars 必须是正安全整数，收到：' + String(maxInputChars));
+    }
+    if (systemBudgetChars !== null && (!Number.isSafeInteger(systemBudgetChars)
+      || systemBudgetChars <= 0 || systemBudgetChars > maxInputChars
+      || role?.layered !== true || typeof role.sections !== 'function')) {
+      throw new TypeError('systemBudgetChars requires layered Role and a positive integer within maxInputChars');
     }
     this.apiKey = apiKey;
     this.baseUrl = baseUrl.replace(/\/+$/, '');
@@ -90,6 +100,7 @@ export class Brain {
     this.memory = memory || new Memory({ dir: './data' });
     this.memoryBlocks = resolveMemoryBlocks(memoryBlocks);
     this.onMemoryBudget = resolveBudgetReporter(onMemoryBudget);
+    this.systemBudgetChars = systemBudgetChars;
   }
 
   /**
@@ -140,7 +151,8 @@ export class Brain {
     const recentView = this.#recentRoundView(key);
     const recent = recentView ? recentView.text : this.memory.renderRecent(RECENT_TURN_LIMIT, { excludeWhere: key });
     // 一次装配：system prompt + 独立 history + 用户原文；预算与 fetch 共用同一份序列化结果
-    const payload = (parts) => {
+    const platform = input.platform || '';
+    const roleContext = (parts) => {
       // 没有非空 L6 引用时保持接入前的 role.build 入参形状：自定义角色适配器可能按对象键判断，
       // 多传一个 taskReferences: [] 会改变它们看到的对象（真实 Role 的输出不受影响）。
       const ctx = {
@@ -149,8 +161,11 @@ export class Brain {
         recent: parts.recent,
       };
       if (parts.taskReferences && parts.taskReferences.length) ctx.taskReferences = parts.taskReferences;
-      ctx.platform = input.platform || '';
-      const sys = this.role.build(ctx);
+      ctx.platform = platform;
+      return ctx;
+    };
+    const payload = (parts) => {
+      const sys = this.role.build(roleContext(parts));
       const messages = [{ role: 'system', content: sys }];
       for (const h of history.slice(-20)) {
         messages.push({ role: h.isSelf ? 'assistant' : 'user', content: String(h.text || '') });
@@ -164,11 +179,34 @@ export class Brain {
     const measure = (candidate) => JSON.stringify(payload(candidate)).length;
     // 视图报出的轮次可能超出本次请求范围，诊断里也只报范围内的轮数
     const roundsAvailable = recentView ? Math.min(recentView.roundCount, RECENT_TURN_LIMIT) : 0;
-    let body = JSON.stringify(payload(parts));
+    let quota;
+    let systemCharsUsed;
+    let body;
     let finalParts = parts;
     let roundsDropped = 0;
     let topicsDropped = 0;
-    if (body.length > this.maxInputChars) {
+    if (this.systemBudgetChars !== null) {
+      quota = planLayerQuotas({
+        parts,
+        systemChars: this.systemBudgetChars,
+        requestCap: this.maxInputChars,
+        recentView: recentView && {
+          text: recentView.text,
+          roundCount: roundsAvailable,
+          renderFrom: (n) => recentView.renderFrom(n),
+        },
+        topicView: () => this.memory.personTopicView?.(userId),
+        measureRequest(candidate) {
+          const request = payload(candidate);
+          return { system: request.messages[0].content.length, request: JSON.stringify(request).length };
+        },
+      });
+      ({ parts: finalParts, roundsDropped, topicsDropped } = quota);
+    }
+    const request = payload(finalParts);
+    if (quota) systemCharsUsed = request.messages[0].content.length;
+    body = JSON.stringify(request);
+    if (!quota && body.length > this.maxInputChars) {
       // ① 先按最近对话的记录顺序，从最旧开始移除完整轮次（按真实序列化 payload 量，能放下即停）；
       // ② 放弃最近对话后，仍超预算则按整条裁剪旧话题；
       // ③ 沿用整块丢弃 recent → memory → situation；
@@ -202,6 +240,7 @@ export class Brain {
     // 诊断在 fetch 之前发出：超限时也先留一条记录，再照旧抛错。
     // 没接回调时连事件对象都不构造，默认路径没有任何额外开销。
     if (this.onMemoryBudget) {
+      const quotaStats = quota && this.#quotaStats(quota, roleContext(finalParts), systemCharsUsed);
       this.#emitMemoryBudget(this.#memoryBudgetEvent({
         parts,
         finalParts,
@@ -209,6 +248,7 @@ export class Brain {
         roundsDropped,
         topicsDropped,
         charsUsed: body.length,
+        quotaStats,
       }));
     }
     if (body.length > this.maxInputChars) throw contextOverflow(this.maxInputChars, body.length);
@@ -246,7 +286,25 @@ export class Brain {
    * 脱敏的 memory-budget 事件：只有块名、纯计数和最终的字符规模。
    * 不含任何正文、异常原文、key/userId 或 prompt——字段集合固定，消费方可直接落 journal。
    */
-  #memoryBudgetEvent({ parts, finalParts, roundsAvailable, roundsDropped, topicsDropped, charsUsed }) {
+  #quotaStats(quota, ctx, systemCharsUsed) {
+    const sizes = Object.fromEntries(this.role.sections(ctx).map(({ name, chars }) => [name, chars]));
+    const stable = sizes.baseRules + sizes.extra + sizes.card;
+    const cap = this.systemBudgetChars;
+    return Object.freeze({
+      systemBudgetChars: cap,
+      systemCharsUsed,
+      l1Chars: stable,
+      l1WithinTarget: stable / cap >= 0.40 && stable / cap <= 0.60,
+      recentChars: sizes.recent,
+      memoryChars: sizes.memory,
+      situationChars: sizes.situation,
+      protocolChars: sizes.platform,
+      protocolOverTarget: sizes.platform > Math.floor(cap * 0.05),
+      dropped: Object.freeze(quota.dropped),
+    });
+  }
+
+  #memoryBudgetEvent({ parts, finalParts, roundsAvailable, roundsDropped, topicsDropped, charsUsed, quotaStats }) {
     const evictedParts = EVICTION_ORDER.filter((name) => !isEmptyBlock(parts[name]) && isEmptyBlock(finalParts[name]));
     // 整块淘汰时这一轮一条都没进请求；否则就是「范围内轮数 - 按整轮裁掉的轮数」
     const roundsKept = evictedParts.includes('recent')
@@ -254,7 +312,7 @@ export class Brain {
       : Math.max(0, roundsAvailable - roundsDropped);
     return Object.freeze({
       event: 'memory-budget',
-      version: MEMORY_BUDGET_EVENT_VERSION,
+      version: quotaStats ? LAYER_QUOTA_EVENT_VERSION : MEMORY_BUDGET_EVENT_VERSION,
       maxChars: this.maxInputChars,
       charsUsed,
       withinBudget: charsUsed <= this.maxInputChars,
@@ -264,6 +322,7 @@ export class Brain {
       topicsDropped,
       blocksEvicted: evictedParts.length,
       evictedParts: Object.freeze(evictedParts),
+      ...(quotaStats ? { quotas: quotaStats } : {}),
     });
   }
 
