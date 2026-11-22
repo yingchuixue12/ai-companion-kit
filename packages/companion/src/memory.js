@@ -21,6 +21,25 @@
 import fs from 'node:fs';
 import path from 'node:path';
 
+/**
+ * 把一批对话记录拼成注入文本。
+ * `renderRecent` 与 `recentRoundView` 共用这一段拼法：同一条记录、同一种格式，
+ * 因此「丢掉最旧若干轮」后的文本与对剩余记录调 `renderRecent` 逐字节相同。
+ */
+function renderRecentRows(rows) {
+  if (!rows.length) return '';
+  const lines = rows.map((r) => {
+    const when = new Date(r.t).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' });
+    const place = r.where.startsWith('group') ? '群里' : '私聊';
+    const parts = [];
+    if (r.text) parts.push(r.who + '（' + place + '）：' + r.text);
+    if (r.reply) parts.push('你：' + r.reply);
+    return '  ' + when + '  ' + parts.join('\n        ');
+  });
+  return '【最近的真实对话（跨场合合在一起）】\n' + lines.join('\n')
+    + '\n（这些是真说过的，别装作不知道，也别生硬复述）\n';
+}
+
 export class Memory {
   /**
    * @param {object} opts
@@ -165,18 +184,40 @@ export class Memory {
 
   /** 把最近对话渲染成一段可注入的文字 */
   renderRecent(n = 20, opts = {}) {
+    return renderRecentRows(this.recentTurns(n, opts));
+  }
+
+  /**
+   * 最近对话的**结构化视图**（可选能力，给大脑按整轮裁剪用）
+   * ───────────────────────────────────────────────────────────
+   * 一次读盘同时给出两样东西：
+   *   text        与 `renderRecent(n, opts)` 逐字节相同的整段渲染
+   *   roundCount  完整轮次数（一条对话记录就是一轮：对方说的话 + 你的回复）
+   *   renderFrom(k) 丢掉最旧 k 整轮后的渲染；k=0 与 text 相同，k>=roundCount 为空串
+   *
+   * 为什么要有它：超预算时按「记录顺序」先丢最旧的完整轮次，比整块丢 recent 能多留
+   * 后来的对话；而轮次边界来自 `recentTurns` 的**记录结构**，不是从渲染文本里猜分隔符。
+   * 视图不改变取数范围与过滤：`n` / `excludeWhere` 原样交给 `recentTurns`。
+   *
+   * 兼容：`renderRecent` 被覆盖（子类或自定义实现）时无法保证与本视图同一套渲染，
+   * 返回 null 让调用方退回整块 `renderRecent` 的旧路径——不猜、不覆盖既有语义。
+   *
+   * @returns {{text: string, roundCount: number, renderFrom: (dropOldestRounds: number) => string} | null}
+   */
+  recentRoundView(n = 20, opts = {}) {
+    if (this.renderRecent !== Memory.prototype.renderRecent) return null;
     const rows = this.recentTurns(n, opts);
-    if (!rows.length) return '';
-    const lines = rows.map((r) => {
-      const when = new Date(r.t).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' });
-      const place = r.where.startsWith('group') ? '群里' : '私聊';
-      const parts = [];
-      if (r.text) parts.push(r.who + '（' + place + '）：' + r.text);
-      if (r.reply) parts.push('你：' + r.reply);
-      return '  ' + when + '  ' + parts.join('\n        ');
-    });
-    return '【最近的真实对话（跨场合合在一起）】\n' + lines.join('\n')
-      + '\n（这些是真说过的，别装作不知道，也别生硬复述）\n';
+    if (!Array.isArray(rows)) return null;
+    return {
+      text: renderRecentRows(rows),
+      roundCount: rows.length,
+      renderFrom(dropOldestRounds) {
+        const drop = Number.isSafeInteger(dropOldestRounds) && dropOldestRounds > 0
+          ? Math.min(dropOldestRounds, rows.length)
+          : 0;
+        return renderRecentRows(rows.slice(drop));
+      },
+    };
   }
 
   /** 导出（调试/备份用） */

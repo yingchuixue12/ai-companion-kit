@@ -13,6 +13,12 @@ import { Memory } from './memory.js';
 import { Role } from './role.js';
 import { planContextBudget } from './context-budget.js';
 
+/**
+ * 最近对话的请求上限：既是 `renderRecent` 的条数，也是按整轮裁剪时最多考虑的轮数。
+ * 结构化视图报出更多轮时按它收紧，避免对请求范围之外的轮次做无意义的尝试。
+ */
+const RECENT_TURN_LIMIT = 20;
+
 /** 请求体超预算时抛出的错误：只带计数，不带任何正文 */
 function contextOverflow(maxInputChars, inputChars) {
   const error = new Error('输入超出上下文预算：请求体 ' + inputChars + ' 字符 > 上限 ' + maxInputChars);
@@ -66,7 +72,10 @@ export class Brain {
     const shouldRecord = record && !deferred;
 
     const memLine = this.memory.renderPerson(userId);
-    const recent = this.memory.renderRecent(20, { excludeWhere: key });
+    // 最近对话：能拿到结构化轮次就用它一次读盘同时给出整段文本与按整轮裁剪的能力；
+    // 拿不到（只有 renderRecent 的注入 adapter / 自定义渲染）就照旧调用 renderRecent。
+    const recentView = this.#recentRoundView(key);
+    const recent = recentView ? recentView.text : this.memory.renderRecent(RECENT_TURN_LIMIT, { excludeWhere: key });
     // 一次装配：system prompt + 独立 history + 用户原文；预算与 fetch 共用同一份序列化结果
     const payload = (parts) => {
       const sys = this.role.build({
@@ -84,12 +93,15 @@ export class Brain {
     };
 
     const parts = { situation, memory: memLine, recent };
+    const measure = (candidate) => JSON.stringify(payload(candidate)).length;
     let body = JSON.stringify(payload(parts));
     if (body.length > this.maxInputChars) {
-      // 超限：按 recent → memory → situation 整块丢弃（platform / history / 用户原文不动）
+      // ① 先按最近对话的记录顺序，从最旧开始移除完整轮次（按真实序列化 payload 量，能放下即停）；
+      // ② 仍然放不下，才沿用 recent → memory → situation 整块丢弃（platform / history / 用户原文不动）。
+      const trimmed = this.#dropOldestRounds(parts, recentView, measure);
       const plan = planContextBudget({
-        measure: (candidate) => JSON.stringify(payload(candidate)).length,
-        parts,
+        measure,
+        parts: trimmed,
         maxChars: this.maxInputChars,
       });
       body = JSON.stringify(payload(plan.parts));
@@ -123,6 +135,50 @@ export class Brain {
       };
     }
     return result;
+  }
+
+  /**
+   * 取最近对话的结构化轮次视图（可选能力，见 `Memory.recentRoundView`）。
+   * 拿不到就返回 null：只有 `renderRecent` 的注入 adapter、自定义渲染、或形状不对的返回值，
+   * 都会退回旧的整块丢弃路径——这里不猜、也不改既有渲染语义。
+   */
+  #recentRoundView(key) {
+    if (typeof this.memory.recentRoundView !== 'function') return null;
+    let view;
+    try {
+      view = this.memory.recentRoundView(RECENT_TURN_LIMIT, { excludeWhere: key });
+    } catch {
+      return null;
+    }
+    if (!view || typeof view !== 'object') return null;
+    if (typeof view.text !== 'string' || typeof view.renderFrom !== 'function') return null;
+    if (!Number.isSafeInteger(view.roundCount) || view.roundCount < 0) return null;
+    return view;
+  }
+
+  /**
+   * 超预算时的第一步：按最近对话的**记录顺序**从最旧开始移除完整轮次。
+   * 每丢一轮就按实际序列化 payload 量一次，能放下即停；固定人格层和当前输入不参与裁剪。
+   * 结构化轮次不可用、`renderFrom` 抛错或返回非字符串、或丢到只剩最新一轮仍放不下，
+   * 都原样返回，交给 `planContextBudget` 沿用 recent → memory → situation 整块丢弃。
+   * 只兜住 adapter 调用本身：measure（含 role.build）的错误照常往上抛。
+   */
+  #dropOldestRounds(parts, view, measure) {
+    if (!view || !view.roundCount) return parts;
+    // 视图报出的轮数超过本次请求的条数时按请求上限收紧（多出来的不在请求范围内）
+    const roundCount = Math.min(view.roundCount, RECENT_TURN_LIMIT);
+    for (let dropped = 1; dropped < roundCount; dropped += 1) {
+      let recent;
+      try {
+        recent = view.renderFrom(dropped);
+      } catch {
+        return parts;
+      }
+      if (typeof recent !== 'string') return parts;
+      const candidate = { ...parts, recent };
+      if (measure(candidate) <= this.maxInputChars) return candidate;
+    }
+    return parts;
   }
 
   /** 把这一轮写回记忆（默认立即记与 deferred 提交共用同一份写法） */
