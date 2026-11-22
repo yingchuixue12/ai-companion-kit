@@ -79,6 +79,29 @@ function recordText(record) {
   return typeof record?.text === 'string' ? record.text.trim() : '';
 }
 
+function observedTime(value) {
+  // An explicit offset keeps the policy independent of the host timezone.
+  const stamp = typeof value === 'string' && /^(\d{4}-\d{2}-\d{2})T(?:[01]\d|2[0-3]):[0-5]\d:[0-5]\d(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$/u.exec(value);
+  if (!stamp) return -Infinity;
+  const day = new Date(stamp[1] + 'T00:00:00Z');
+  if (!Number.isFinite(day.getTime()) || !day.toISOString().startsWith(stamp[1])) return -Infinity;
+  const time = Date.parse(value);
+  return Number.isFinite(time) ? time : -Infinity;
+}
+
+function preferRecentExperiences(candidates) {
+  const positions = [];
+  for (const [index, entry] of candidates.entries()) {
+    if (entry.kind === 'topic' && entry.record.layer === 'shared_experience') positions.push(index);
+  }
+  const topics = positions.map((index) => ({ entry: candidates[index], time: observedTime(candidates[index].record.observedAt) }));
+  // Unknown timestamps have lowest retention priority; ties keep source order.
+  topics.sort((a, b) => a.time === b.time ? a.entry.index - b.entry.index : b.time - a.time);
+  const ordered = [...candidates];
+  for (const [rank, index] of positions.entries()) ordered[index] = topics[rank].entry;
+  return ordered;
+}
+
 /** 组装：按类别分组，组内用「；」连接，组间换行（与 renderPerson 的段落形状一致） */
 function assemble(kindOrder, byKind, labels) {
   const lines = [];
@@ -99,6 +122,7 @@ function assemble(kindOrder, byKind, labels) {
  *   maxRecords?: number,     // 默认 36（沿用 12+12+8+4 的渲染上限）
  *   kindOrder?: string[],    // 默认 trait/fact/topic/pending
  *   minConfidence?: number,  // 默认 0；只过滤，不改写
+ *   preferRecentExperiences?: boolean, // 只影响 L4 topic 的预算优先级；不改变输出顺序
  *   render?: (record:any) => string
  * }} options
  * @returns {{
@@ -169,13 +193,15 @@ export function budgetMemoryBlock(records, options = {}) {
 
   // ── 2. 确定性排序：类别顺序 → 组内原顺序 ──────────────────────────────
   candidates.sort((a, b) => (kindRank.get(a.kind) - kindRank.get(b.kind)) || (a.index - b.index));
+  const preferRecent = options.preferRecentExperiences === true;
+  const selectionOrder = preferRecent ? preferRecentExperiences(candidates) : candidates;
 
   // ── 3. 贪心取前缀：第一个放不下的记录之后全部标 budget ────────────────
   const includedRecords = [];
   const byKind = new Map();
   let closed = false;
   let closeReason = '';
-  for (const candidate of candidates) {
+  for (const candidate of selectionOrder) {
     if (!closed) {
       if (includedRecords.length >= maxRecords) {
         closed = true;
@@ -202,9 +228,20 @@ export function budgetMemoryBlock(records, options = {}) {
     if (closed) omitted.push({ id: candidate.id, kind: candidate.kind, reason: 'budget' });
   }
 
+  let renderedRecords = includedRecords;
+  let renderedKinds = byKind;
+  if (preferRecent) {
+    const includedByIndex = new Map(includedRecords.map((entry) => [entry.index, entry]));
+    renderedRecords = candidates.filter((entry) => includedByIndex.has(entry.index)).map((entry) => includedByIndex.get(entry.index));
+    renderedKinds = new Map();
+    for (const { kind, line } of renderedRecords) {
+      if (!renderedKinds.has(kind)) renderedKinds.set(kind, []);
+      renderedKinds.get(kind).push(line);
+    }
+  }
   const text = typeof render === 'function'
-    ? includedRecords.map((entry) => entry.line).join('\n')
-    : assemble(kindOrder, byKind, DEFAULT_KIND_LABELS);
+    ? renderedRecords.map((entry) => entry.line).join('\n')
+    : assemble(kindOrder, renderedKinds, DEFAULT_KIND_LABELS);
 
   if (!records.length) {
     diagnostics.push({ code: 'empty-input' });
@@ -216,7 +253,7 @@ export function budgetMemoryBlock(records, options = {}) {
 
   return {
     text,
-    included: includedRecords.map((entry) => entry.id),
+    included: renderedRecords.map((entry) => entry.id),
     omitted,
     charsUsed: text.length,
     diagnostics,
