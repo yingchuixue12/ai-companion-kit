@@ -2047,34 +2047,141 @@ export function isTapAllPassed(stdout) {
     && skipped !== null && Number(skipped[1]) === 0;
 }
 
+/**
+ * 读取 TAP 末尾的关键计数；缺行就给 null，报告里不编造数字。
+ * @param {string} stdout
+ * @returns {{tests:number|null, pass:number|null, fail:number|null, skipped:number|null}}
+ */
+export function parseTapCounts(stdout) {
+  const text = String(stdout ?? '');
+  const read = (key) => {
+    const match = text.match(new RegExp(`^# ${key} (\\d+)\\r?$`, 'm'));
+    return match ? Number(match[1]) : null;
+  };
+  return {
+    tests: read('tests'),
+    pass: read('pass'),
+    fail: read('fail'),
+    skipped: read('skipped'),
+  };
+}
+
+/**
+ * 在独立子进程里跑仓库内的一个 node --test 文件，只收 TAP 结论与退出码；
+ * stdout/stderr 不写进报告（产品日志与合成正文都不外泄）。
+ * 命令固定用仓库相对路径：Windows 下 node --test 不认绝对 UNC 参数。
+ * @param {string} file packages/companion/test/ 下的文件名
+ * @returns {Promise<{command:string, exitCode:number|null, counts:object, passed:boolean}>}
+ */
+async function runNodeTest(file) {
+  const env = { ...process.env };
+  delete env.NODE_TEST_CONTEXT;
+  const relative = 'packages/companion/test/' + file;
+  const command = 'node --test --test-reporter=tap -- ' + relative;
+  try {
+    const { stdout } = await execFileAsync(process.execPath, [
+      '--test', '--test-reporter=tap', '--', relative,
+    ], { cwd: new URL('../../', import.meta.url), env, timeout: 15_000 });
+    return { command, exitCode: 0, counts: parseTapCounts(stdout), passed: isTapAllPassed(stdout) };
+  } catch (error) {
+    return {
+      command,
+      exitCode: typeof error?.code === 'number' ? error.code : null,
+      counts: parseTapCounts(error?.stdout ?? ''),
+      passed: false,
+    };
+  }
+}
+
 async function runX06(harness) {
   // Run in a separate process so the fake WebSocket hooks and timers cannot
   // affect the rest of the matrix.
-  const env = { ...process.env };
-  delete env.NODE_TEST_CONTEXT;
   for (const [file, title] of [
     ['onebot-reconnect-replay.test.mjs', '重连后已消费消息不复投，新消息正常投递'],
     ['onebot-closed-socket.test.mjs', '同一次断线只重连一次，忽略失效连接的事件'],
   ]) {
-    // Windows Node's test runner does not discover absolute UNC test arguments.
-    const regression = 'packages/companion/test/' + file;
-    let passed = false;
-    try {
-      const { stdout } = await execFileAsync(process.execPath, [
-        '--test', '--test-reporter=tap', '--', regression,
-      ], { cwd: new URL('../../', import.meta.url), env, timeout: 15_000 });
-      passed = isTapAllPassed(stdout);
-    } catch {
-      // The report must not include child stdout or stderr.
-    }
+    const outcome = await runNodeTest(file);
     harness.step({
       title,
       input: { kind: 'synthetic-onebot-regression', file },
       expected: { passed: true },
-      actual: { passed },
+      actual: { passed: outcome.passed },
     });
   }
   return { limitation: 'synthetic-cli-reconnect-no-host-journal' };
+}
+
+/* ═══════════════ X-09 公开 CLI 纠正轮（B-04 旁证） ═══════════════ */
+
+/**
+ * X-09：直接把 #107 已合入的公开 CLI 纠正轮合约测试收进矩阵。
+ *
+ * 跑的是 `packages/companion/test/cli-repair-turn.test.mjs` 原文件，
+ * 不复制 489 行 harness、不另写同义断言：
+ *   - 真实 Brain / Memory / handleTurn，模型 fetch 是合成的；
+ *   - 角色卡与账本都只落在临时目录；
+ *   - 覆盖同会话历史、非纠正/群聊原样、发送确认后才落账等合约。
+ *
+ * 边界：这只是公开 CLI 的合约测试旁证，不是芙兰宿主或真实 QQ 的纠正轮接线；
+ * B-04 在场景表里保持 not-covered。
+ */
+async function runX09(harness) {
+  const file = 'cli-repair-turn.test.mjs';
+  const outcome = await runNodeTest(file);
+  harness.step({
+    title: '公开 CLI 纠正轮合约测试单跑：真实 Brain/Memory/handleTurn + 合成模型 fetch',
+    input: {
+      kind: 'synthetic-cli-repair-turn-contract',
+      file,
+      command: outcome.command,
+      note: '直接执行已合入的 #107 测试文件；不复制用例，不读真实角色卡/账本/配置',
+    },
+    expected: {
+      command: 'node --test --test-reporter=tap -- packages/companion/test/cli-repair-turn.test.mjs',
+      exitCode: 0,
+      passed: true,
+      failCount: 0,
+      skippedCount: 0,
+    },
+    actual: {
+      command: outcome.command,
+      exitCode: outcome.exitCode,
+      passed: outcome.passed,
+      failCount: outcome.counts.fail,
+      skippedCount: outcome.counts.skipped,
+    },
+  });
+
+  return {
+    modules: [
+      'index.js#handleTurn',
+      'index.js#buildRepairHistory',
+      'reply-alignment.js#detectRepairIntent',
+      'brain.js',
+      'memory.js',
+    ],
+    limitation: 'public-cli-repair-turn-contract-test-synthetic-model',
+    scope: 'sub-scenario',
+    corroborates: ['B-04'],
+    // 关键数字留在 artifacts：命令、退出码、TAP 的 tests/pass/fail/skipped。
+    command: outcome.command,
+    exitCode: outcome.exitCode,
+    tap: outcome.counts,
+    proofRequired: [
+      'B-04 仍缺宿主集成路径：真实 QQ 私聊进入芙兰宿主后的纠正轮接线与平台收发',
+      'X-09 只覆盖公开通用 CLI 的 handleTurn 合约测试（真实 Brain/Memory + 合成模型 fetch + 合成角色卡），不能代替宿主/真实平台收发',
+      'T9 真实 QQ 验收仍需人工执行，不能把芙兰宿主或真实 QQ 记完成',
+    ],
+    boundary: {
+      realQQ: false,
+      flandreHost: false,
+      realModel: false,
+      syntheticModelFetch: true,
+      syntheticRoleCard: true,
+      tempLedger: true,
+    },
+    note: 'X-09 是 B-04 的公开 CLI 旁证，不是 B-04 通过证据；B-04 在场景表里保持 not-covered。',
+  };
 }
 
 /* ═══════════════ D-01 离线 ASR 成功（桩） ═══════════════ */
@@ -3161,13 +3268,17 @@ async function runE05(harness) {
  * 未覆盖项：依赖本 checkout 里不存在的宿主集成 / QQ 集成 / Web presence 宿主。
  * 按 id 建索引（不按下标），增删一条不会让场景表悄悄错位。
  *
- * B-05 有 X-08 的**公开 CLI 普通私聊旁证**，B-14 / B-18 有 X-07 的**通用入口旁证**；
- * 三者仍缺宿主/真实 QQ 集成路径，`proofRequired` 记录还差什么，
- * `corroboratedBy` 只指向旁证，不改变 not-covered。
+ * B-04 有 X-09 的**公开 CLI 纠正轮旁证**，B-05 有 X-08 的**公开 CLI 普通私聊旁证**，
+ * B-14 / B-18 有 X-07 的**通用入口旁证**；它们仍缺宿主/真实 QQ 集成路径，
+ * `proofRequired` 记录还差什么，`corroboratedBy` 只指向旁证，不改变 not-covered。
  */
 const NOT_COVERED = Object.freeze(Object.fromEntries([
   ['B-03', 'requires-host-integration'],
-  ['B-04', 'requires-host-integration'],
+  ['B-04', 'requires-host-integration', [
+    'B-04 仍缺宿主集成路径：真实 QQ 私聊进入芙兰宿主后的纠正轮接线与平台收发',
+    'X-09 只覆盖公开通用 CLI 的 handleTurn 合约测试（真实 Brain/Memory + 合成模型 fetch + 合成角色卡），不能代替宿主/真实平台收发',
+    'T9 真实 QQ 验收仍需人工执行，不能把芙兰宿主或真实 QQ 记完成',
+  ], ['X-09']],
   ['B-05', 'requires-qq-integration', [
     'B-05 仍缺 QQ / 芙兰宿主集成路径：真实 QQ 私聊进入宿主后的记忆引用、回复与落账',
     'X-08 只覆盖公开通用 CLI + 合成 OneBot + 合成模型 fetch 的普通私聊子场景，不能代替真实平台收发',
@@ -3191,7 +3302,7 @@ const NOT_COVERED = Object.freeze(Object.fromEntries([
   status: 'not-covered',
   title: '未覆盖：依赖缺失的宿主/QQ 集成源码',
   reason,
-  requires: '宿主集成路径或 QQ/OneBot 集成路径（本 checkout 不存在；X-07/X-08 只是公开 CLI 旁证）',
+  requires: '宿主集成路径或 QQ/OneBot 集成路径（本 checkout 不存在；X-07/X-08/X-09 只是公开 CLI 旁证）',
   proofRequired: proofRequired ?? [],
   corroboratedBy: corroboratedBy ?? [],
 }])));
@@ -3237,6 +3348,8 @@ export const SCENARIOS = Object.freeze([
   ...OWNER_PRIVATE_SCENARIOS,
   // X-08 只给 B-05 补公开 CLI 的正常私聊旁证；芙兰宿主/真实 QQ 仍是 not-covered。
   ...MEMORY_REFERENCE_SCENARIOS,
+  // X-09 只把 #107 已合入的公开 CLI 纠正轮合约测试收进矩阵，作为 B-04 旁证；B-04 仍是 not-covered。
+  { id: 'X-09', aliases: ['cli-repair-turn'], gate: 'extra', status: 'covered', title: 'X-09（增补）公开 CLI 纠正轮：同会话历史、非纠正/群聊原样、确认后落账（B-04 旁证）', run: runX09 },
   // D-01…D-05 / E-01…E-05 是执行计划 §9.3 的独立验收项；与 X-01/X-03/X-04 的增补旁证区分，不复用同一 ID。
   { id: 'D-01', aliases: ['asr-success'], gate: 'extra', status: 'covered', title: 'D-01 离线 ASR 成功（桩）：转写/置信度/元数据；无 memory port 不写长期记忆', run: runD01 },
   { id: 'D-02', aliases: ['asr-failure'], gate: 'extra', status: 'covered', title: 'D-02 ASR 失败（桩）：asr-failed + ask-repeat，保留元数据', run: runD02 },
