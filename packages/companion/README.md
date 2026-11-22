@@ -490,6 +490,7 @@ node src/index.js --config ./config.json --reminders
 - `--dry-run`：提醒整体不装配 —— 调度运行时不创建、命令不识别、
   不会发任何消息；横幅显示「提醒 开（干跑不启动）」；
 - `--check`：只体检角色卡就退出，不连 OneBot，也不碰提醒。
+- `onebot.statusDiagnostics: true`：以 JSON 记录连接、错误和断开，并提供连接尝试次数和重连间隔。启用后，连接日志不再输出 WebSocket 地址或原始异常；缺省时沿用原日志。
 
 ### 三个命令（只认主人私聊、单行整句）
 

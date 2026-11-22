@@ -119,6 +119,7 @@ export function normalizeConfig(cfg, file, argv = process.argv) {
       httpUrl: cfg.onebot?.httpUrl || 'http://127.0.0.1:3000',
       accessToken: cfg.onebot?.accessToken || '',
     },
+    oneBotStatusDiagnostics: cfg.onebot?.statusDiagnostics === true,
 
     names: cfg.names || [],
     keywords: cfg.keywords || [],
@@ -169,6 +170,16 @@ const SAFE_ERROR_CODES = new Set([
   'ECONNREFUSED', 'ECONNRESET', 'ETIMEDOUT', 'ENOTFOUND',
   'EAI_AGAIN', 'EPIPE', 'ENETUNREACH', 'EHOSTUNREACH',
 ]);
+
+function logOneBotStatus(event) {
+  if (!['connected', 'disconnected', 'error'].includes(event?.state)) return;
+  const bounded = (value) => Number.isSafeInteger(value) && value >= 0 ? value : 0;
+  console.log('[onebot-status] ' + JSON.stringify({
+    state: event.state,
+    attempt: bounded(event.attempt),
+    retryInMs: bounded(event.retryInMs),
+  }));
+}
 
 /**
  * 统一的失败报告：固定文案 + 白名单错误码。
@@ -391,7 +402,7 @@ export async function main({ createBot, proc: injectedProc, process: injectedPro
   console.log('  模型      ' + cfg.model + ' @ ' + cfg.baseUrl);
   console.log('  角色卡    ' + cfg.roleCard);
   console.log('  数据目录  ' + cfg.dataDir);
-  console.log('  OneBot    ' + cfg.onebot.wsUrl);
+  console.log('  OneBot    ' + (cfg.oneBotStatusDiagnostics ? '连接诊断已启用' : cfg.onebot.wsUrl));
   console.log('  名字      ' + (cfg.names.join(' / ') || '（没配）'));
   console.log('  主人      ' + (cfg.ownerIds.join(', ') || '（没配）'));
   console.log('  干跑      ' + (cfg.dryRun ? '是（不会真发）' : '否'));
@@ -457,6 +468,7 @@ export async function main({ createBot, proc: injectedProc, process: injectedPro
 
   const bot = buildBot({
     ...cfg.onebot,
+    ...(cfg.oneBotStatusDiagnostics ? { onStatus: logOneBotStatus } : {}),
     onMessage: (msg) => {
       // --owner-private：入口第一道闸。被拒消息不进入 presence / waker /
       // 模型 / 记忆 / 任务 / 发送；日志只留固定原因码，不写正文或账号。
