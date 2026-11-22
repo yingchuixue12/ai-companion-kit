@@ -12,8 +12,15 @@
  * ── 明确不做什么（避免把框架当成真实验收）─────────────────────
  *   - 不发真实 QQ / OneBot / HTTP：默认 fetchImpl 直接拒绝，且**不改全局 fetch**
  *     （`globalThis.fetch` 从头到尾不动，避免制造进程级网络绕过）。
- *   - 不读写仓库 `data/`、真实配置、私密记忆或日志：tempDir 必须是系统临时目录，
+ *   - 不读写仓库 `data/`、真实配置、私密记忆或日志：临时区必须落在系统临时目录下，
  *     指到仓库里直接拒绝（code `unsafe-temp-dir`）。
+ *   - 临时目录所有权：harness 永远自己在调用者给的（经验证的专用）父目录下 mkdtemp
+ *     一个自己的目录，cleanup 也只删这一个。系统临时根本身、仓库、越界实路径
+ *     （软链接 / 联接点指出去）都拒绝；解析不出真实路径的断链同样拒绝
+ *     （detail `unresolvable-real-path`，与"确实不存在"的 `parent-missing` 分开）；
+ *     调用者父目录里的东西一概不碰。
+ *   - 删除前核对**目录身份**：创建时锁定真实路径 + dev/ino + 写进目录的所有权标记，
+ *     清理时三者都要对得上。父目录被改指、或同名目录被替换，一律拒绝删除。
  *   - 不调用真实模型：本 checkout 的 `brain.js` 直接调用全局 `fetch`，没有注入点，
  *     所以模型侧一律用脚本化替身；相关 step 的 `model.transport` 记
  *     `synthetic-scripted`，报告里同时给 `model-transport-synthetic` 诊断码。
@@ -25,6 +32,7 @@
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { randomUUID } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 
 import { Memory } from '../../packages/companion/src/memory.js';
@@ -46,6 +54,12 @@ export const DEFAULT_SEED = 20260101;
 
 /** 临时目录名前缀。 */
 const TEMP_PREFIX = 'ai-companion-acceptance-';
+
+/**
+ * 所有权标记文件名：创建时写进自建临时根，内容就是本次运行的随机 token。
+ * 它是框架自己的账本，不参与场景证据（tempFiles 会跳过它）。
+ */
+export const TEMP_OWNER_MARKER = '.harness-owner';
 
 /** 错误码白名单：只允许这类形状的 code 出现在诊断里。 */
 const SAFE_CODE = /^[A-Za-z][A-Za-z0-9:_-]{0,63}$/u;
@@ -72,6 +86,31 @@ export function projectError(error) {
   return detail === null ? { code } : { code, detail };
 }
 
+/** 当前平台的文件系统是否大小写不敏感（只影响路径比较，不影响 I/O）。 */
+const CASE_INSENSITIVE_FS = process.platform === 'win32';
+
+/**
+ * 路径比较用的归一化：绝对化 + （Windows）小写。
+ * 只做词法归一，不碰文件系统；软链接 / 联接点的解析见 resolveRealPath。
+ * @param {string} value
+ * @param {boolean} caseInsensitive
+ */
+function normalizeForCompare(value, caseInsensitive) {
+  const text = path.resolve(String(value));
+  return caseInsensitive ? text.toLowerCase() : text;
+}
+
+/**
+ * 归一化后的包含判断：相等或真在下一层。
+ * 父目录本身以分隔符结尾（盘根 `C:\`、UNC 共享根 `\\host\share\`）时不再补第二个，
+ * 否则共享根会被判成"谁都不在它下面"。
+ */
+function isInsideNormalized(parent, candidate) {
+  if (candidate === parent) return true;
+  const prefix = parent.endsWith(path.sep) ? parent : parent + path.sep;
+  return candidate.startsWith(prefix);
+}
+
 /**
  * 路径包含判断（平台感知）。
  * Windows 文件系统大小写不敏感：先统一小写再比，否则 `c:/users/...` 会被误判成
@@ -80,29 +119,238 @@ export function projectError(error) {
  * @param {string} candidate 候选路径
  */
 export function isPathInside(parent, candidate) {
-  const normalize = (value) => {
-    const text = path.resolve(String(value));
-    return process.platform === 'win32' ? text.toLowerCase() : text;
-  };
-  const root = normalize(parent);
-  const child = normalize(candidate);
-  return child === root || child.startsWith(root + path.sep);
+  return isInsideNormalized(
+    normalizeForCompare(parent, CASE_INSENSITIVE_FS),
+    normalizeForCompare(candidate, CASE_INSENSITIVE_FS),
+  );
 }
 
 /**
- * 校验临时目录安全：必须在系统临时目录下，且不能落在仓库里。
- * 这是「禁止读写 repo data/、真实配置」这条硬约束的执行点。
+ * 判定「候选专用父目录」是否可接受。**纯函数**：不做任何 I/O。
+ *
+ * 判定顺序（先严重后轻微，detail 是闭合码，会进诊断）：
+ *   1. `root-path`          文件系统根 / UNC 共享根——太浅，递归清理会波及整盘；
+ *   2. `inside-repo`        仓库里（含 data/）——绝不落盘到真实项目目录；
+ *   3. `not-dedicated-root` 系统临时根本身——它是操作系统和其他程序的，不属于本次运行；
+ *   4. `outside-os-tmp`     越出系统临时区。
+ *
+ * 同一套判定既用于调用者给的**写法**，也用于它的**实路径**（先词法、后 realpath），
+ * 所以软链接 / 联接点指到仓库或临时区外同样会被拒。
+ *
+ * @param {string} candidate 候选路径
+ * @param {object} [options]
+ * @param {string} [options.tmpRoot] 系统临时区根（默认 os.tmpdir()）
+ * @param {string} [options.repoRoot] 仓库根（默认 REPO_ROOT）
+ * @param {boolean} [options.caseInsensitive] 是否大小写不敏感（默认按平台）
+ * @returns {{ok: true, path: string} | {ok: false, detail: string}}
  */
-export function assertSafeTempRoot(dir) {
-  const resolved = path.resolve(String(dir));
-  const resolvedTmp = path.resolve(os.tmpdir());
-  if (isPathInside(REPO_ROOT, resolved)) {
-    throw acceptanceError('unsafe-temp-dir', 'inside-repo');
+export function classifyTempParent(candidate, options = {}) {
+  const {
+    tmpRoot = os.tmpdir(),
+    repoRoot = REPO_ROOT,
+    caseInsensitive = CASE_INSENSITIVE_FS,
+  } = options ?? {};
+
+  const normalize = (value) => normalizeForCompare(value, caseInsensitive);
+  const target = normalize(candidate);
+  const tmp = normalize(tmpRoot);
+  const repo = normalize(repoRoot);
+  const filesystemRoot = normalize(path.parse(path.resolve(String(candidate))).root);
+
+  if (target === filesystemRoot) return { ok: false, detail: 'root-path' };
+  if (isInsideNormalized(repo, target)) return { ok: false, detail: 'inside-repo' };
+  if (target === tmp) return { ok: false, detail: 'not-dedicated-root' };
+  if (!isInsideNormalized(tmp, target)) return { ok: false, detail: 'outside-os-tmp' };
+  return { ok: true, path: target };
+}
+
+/**
+ * 目录项是否存在（只问名字，不跟随链接）。
+ *
+ * 用来区分两种长得很像的失败：
+ *   - 路径根本不存在 → `readdir` 里没有这个名字；
+ *   - 目录项在、但解析不出真实路径（Windows 上 junction 不能指向 UNC，会留下
+ *     一个 lstat/realpath 都报 ENOENT 的断链）→ 名字还在。
+ * 拿不到父目录（权限 / 不是目录）时按"不存在"处理，仍然 fail closed。
+ * @param {string} target
+ * @returns {boolean}
+ */
+function entryExistsButUnresolvable(target) {
+  let names;
+  try {
+    names = fs.readdirSync(path.dirname(target));
+  } catch {
+    return false;
   }
-  if (!isPathInside(resolvedTmp, resolved)) {
-    throw acceptanceError('unsafe-temp-dir', 'outside-os-tmp');
+  return names.includes(path.basename(target));
+}
+
+/**
+ * 解析实路径，并把失败原因投影成闭合码（不转发任何系统错误文本）。
+ * 软链接 / 联接点 / 8.3 短名都按真实路径算；解析不了就 fail closed。
+ *
+ * 拒绝理由要分得清，不能笼统一句：真的不存在是 `parent-missing`，
+ * 目录项在但解析不出真实路径（断链 / 非法重解析点）是 `unresolvable-real-path`。
+ * @param {string} target
+ * @returns {{path: string} | {path: null, detail: string}}
+ */
+function resolveRealPath(target) {
+  try {
+    return { path: fs.realpathSync(target) };
+  } catch (error) {
+    const code = typeof error?.code === 'string' ? error.code : '';
+    // ENOENT 且目录项也不在 = 路径不存在；其余（ENOTDIR / ELOOP / 断链 / …）= 解析不出。
+    const missing = code === 'ENOENT' && !entryExistsButUnresolvable(target);
+    return { path: null, detail: missing ? 'parent-missing' : 'unresolvable-real-path' };
   }
+}
+
+/** 系统临时区的实路径（临时根本身可能就是链接，例如 macOS 的 /tmp）。 */
+function realTmpRoot() {
+  const tmp = path.resolve(os.tmpdir());
+  return resolveRealPath(tmp).path ?? tmp;
+}
+
+/** 仓库根的实路径（用于实路径判定；解析不了就退回词法路径）。 */
+function realRepoRoot() {
+  return resolveRealPath(REPO_ROOT).path ?? REPO_ROOT;
+}
+
+/**
+ * 校验调用者给的**专用父目录**，返回解析后的绝对路径。
+ *
+ * 注意语义：这个路径只是「往哪儿放」的父目录，**不是**要清理的目标。
+ * harness 会在它下面自己 mkdtemp 一个目录，cleanup 只删那个目录。
+ *
+ * @param {string} dir
+ * @returns {string} 解析后的绝对路径（父目录本身）
+ */
+export function assertSafeTempParent(dir) {
+  if (typeof dir !== 'string' || dir.trim() === '') {
+    throw acceptanceError('unsafe-temp-dir', 'empty-path');
+  }
+  const resolved = path.resolve(dir);
+
+  // ① 先按调用者给的写法判（纯词法）。
+  const lexical = classifyTempParent(resolved);
+  if (!lexical.ok) throw acceptanceError('unsafe-temp-dir', lexical.detail);
+
+  // ② 再按实路径判一次：软链接 / 联接点不得把"临时父目录"指到仓库或临时区外。
+  //    解析不出实路径的写法同样 fail closed：真的是路径不存在报 parent-missing，
+  //    目录项在但解析不出（断链 / 非法重解析点，例如 Windows 上指向 UNC 的 junction）
+  //    报 unresolvable-real-path——两种理由分开，不笼统当成同一件事。
+  const real = resolveRealPath(resolved);
+  if (real.path === null) throw acceptanceError('unsafe-temp-dir', real.detail);
+  const realVerdict = classifyTempParent(real.path, { tmpRoot: realTmpRoot(), repoRoot: realRepoRoot() });
+  if (!realVerdict.ok) throw acceptanceError('unsafe-temp-dir', realVerdict.detail);
+
+  // ③ 父目录必须确实是目录：不为调用者在任意位置创建目录。
+  //    realpath 已经成功过，正常情况这里一定有 stat；拿不到（并发删除等）按"不是目录"
+  //    处理，同样是 fail closed，不把系统错误文本带出去。
+  const isDirectory = fs.statSync(real.path, { throwIfNoEntry: false })?.isDirectory() === true;
+  if (!isDirectory) throw acceptanceError('unsafe-temp-dir', 'parent-not-directory');
+
   return resolved;
+}
+
+/**
+ * 本 harness 是否有权递归删除这个目录。
+ *
+ * 只认自己的产物：目录名必须是本 harness 的 mkdtemp 前缀，且词法与实路径都要落在
+ * 系统临时区、不是临时根、不在仓库里。任何一条不成立就不删（fail closed）。
+ * @param {string} dir
+ * @returns {boolean}
+ */
+export function isOwnedHarnessTempRoot(dir) {
+  if (typeof dir !== 'string' || dir.trim() === '') return false;
+  const resolved = path.resolve(dir);
+  if (!path.basename(resolved).startsWith(TEMP_PREFIX)) return false;
+  if (!classifyTempParent(resolved).ok) return false;
+  const real = resolveRealPath(resolved);
+  if (real.path === null) return false;
+  return classifyTempParent(real.path, { tmpRoot: realTmpRoot(), repoRoot: realRepoRoot() }).ok;
+}
+
+/**
+ * 目录身份：创建时锁定，删除前复核。
+ *
+ *   - `realPath` 创建时的真实路径——父目录（联接点 / 软链接）被改指、目录被搬走都会变；
+ *   - `dev` / `ino` 文件系统标识（Windows 本地 NTFS 与指向 NTFS 的 UNC 上是
+ *     卷序列号 + 文件索引，可用 BigInt 拿到；不报告 inode 的文件系统（部分 FAT / SMB）
+ *     会是 `'0'`，这时只靠 realPath + token）；
+ *   - `token` 本次运行写进目录的所有权标记——不依赖任何文件系统能力，兜底用。
+ *
+ * 三者不一致就说明"这个路径上的目录已经不是我们建的那个"。
+ * @param {string} dir
+ * @param {string} token
+ * @returns {{realPath: ?string, dev: ?string, ino: ?string, token: string}}
+ */
+function captureDirIdentity(dir, token) {
+  const real = resolveRealPath(dir);
+  const stats = fs.lstatSync(dir, { bigint: true, throwIfNoEntry: false });
+  return Object.freeze({
+    realPath: real.path,
+    dev: stats === undefined ? null : String(stats.dev),
+    ino: stats === undefined ? null : String(stats.ino),
+    token,
+  });
+}
+
+/** 两条真实路径是否同一条（Windows 大小写不敏感）。 */
+function isSameRealPath(left, right) {
+  if (typeof left !== 'string' || typeof right !== 'string') return false;
+  return normalizeForCompare(left, CASE_INSENSITIVE_FS)
+    === normalizeForCompare(right, CASE_INSENSITIVE_FS);
+}
+
+/** 写所有权标记（自建目录里，内容就是 token）。 */
+function writeOwnerMarker(dir, token) {
+  fs.writeFileSync(path.join(dir, TEMP_OWNER_MARKER), token + '\n', 'utf8');
+}
+
+/** 读所有权标记；读不到给 null（fail closed，不猜）。 */
+function readOwnerToken(dir) {
+  try {
+    return fs.readFileSync(path.join(dir, TEMP_OWNER_MARKER), 'utf8').trim();
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * 这个目录是否**仍然是本 harness 创建的那一个**（而不只是"路径还在临时区里"）。
+ *
+ * 校验顺序：路径守卫 → 真实路径与创建时一致 → 目录对象标识一致 → 所有权标记一致。
+ * 任何一条不成立都返回 false，调用方据此拒绝删除。
+ *
+ * 已知边界：如果替换者把所有权标记**连同目录内容一起照抄**，而底层文件系统又不报告
+ * inode（`ino === '0'`），此时无法区分——这种情形下 realPath 仍是唯一线索。
+ * @param {string} dir
+ * @param {{realPath: ?string, dev: ?string, ino: ?string, token: string}} identity
+ * @returns {boolean}
+ */
+export function isSameHarnessTempRoot(dir, identity) {
+  if (!identity || typeof identity !== 'object') return false;
+  if (typeof identity.token !== 'string' || identity.token === '') return false;
+  if (!isOwnedHarnessTempRoot(dir)) return false;
+
+  const resolved = path.resolve(String(dir));
+  const real = resolveRealPath(resolved);
+  if (real.path === null) return false;
+
+  // ① 真实路径必须还是创建时那一条：父目录被改指 / 目录被搬走 → 这里就不同。
+  if (!isSameRealPath(real.path, identity.realPath)) return false;
+
+  // ② 目录对象必须还是同一个：同名替换（删掉重建）会换掉 inode。
+  const stats = fs.lstatSync(resolved, { bigint: true, throwIfNoEntry: false });
+  if (stats === undefined || !stats.isDirectory()) return false;
+  const inoKnown = typeof identity.ino === 'string' && identity.ino !== '0' && identity.ino !== 'null';
+  if (inoKnown && (String(stats.ino) !== identity.ino || String(stats.dev) !== identity.dev)) {
+    return false;
+  }
+
+  // ③ 创建时写进去的所有权标记必须还在且一致（ino 不可用时这条兜底）。
+  return readOwnerToken(resolved) === identity.token;
 }
 
 /* ───────────────────────── 小工具 ───────────────────────── */
@@ -282,8 +530,9 @@ function normalizeDelivery(delivery) {
  * @param {number|(() => number)} [options.now] 虚拟时钟起点（数字）或外部时钟函数；
  *   给函数时 advanceClock 会拒绝（code `clock-not-virtual`）
  * @param {number} [options.seed] 随机源种子
- * @param {string} [options.tempDir] 指定临时目录（必须在系统临时目录下）；
- *   不给就自己 mkdtemp
+ * @param {string} [options.tempDir] 调用者提供的**专用父目录**（必须已存在、在系统临时
+ *   目录下、不在仓库里、实路径也不越界）；harness 会在它下面自己 mkdtemp 一个目录，
+ *   cleanup 只删那一个，父目录里的任何东西都不动。不给就在系统临时目录下自己 mkdtemp。
  * @param {Array|Function} [options.brainReplies] 脚本化假 brain 的回复序列
  * @param {string|string[]|Function} [options.sendBehavior] 假 bot 的发送回执行为
  * @param {(url: string, init?: object) => Promise<any>} [options.fetchImpl]
@@ -327,11 +576,21 @@ export function createHarness(options = {}) {
   };
 
   /* ── 目录 ── */
-  const ownsTempRoot = tempDir === undefined || tempDir === null;
-  const root = ownsTempRoot
-    ? fs.mkdtempSync(path.join(os.tmpdir(), TEMP_PREFIX))
-    : assertSafeTempRoot(tempDir);
-  fs.mkdirSync(root, { recursive: true });
+  // 所有权规则（见文件头）：无论有没有 tempDir，root 都由本 harness 自己 mkdtemp 出来，
+  // cleanup 也只删 root。tempDir 只是「经验证的专用父目录」，它本身永远不被清理。
+  const injectedParent = tempDir === undefined || tempDir === null
+    ? null
+    : assertSafeTempParent(tempDir);
+  const tempBase = injectedParent ?? path.resolve(os.tmpdir());
+  const root = fs.mkdtempSync(path.join(tempBase, TEMP_PREFIX));
+  // 创建即锁定身份：真实路径 + 文件系统标识 + 写进目录的所有权标记。
+  // 清理时按这三样核对——只确认"路径还在临时区里"不够：
+  // 调用者可以把父目录（甚至允许范围内的 junction）改指到另一个临时目录，
+  // 那里若恰好有同名目录，就会误删别人的东西。
+  const ownerToken = randomUUID();
+  writeOwnerMarker(root, ownerToken);
+  const tempRootIdentity = captureDirIdentity(root, ownerToken);
+  const ownsTempRoot = true;
   let cleaned = false;
   const pathOf = (...segments) => path.join(root, ...segments.map(String));
   /**
@@ -351,11 +610,14 @@ export function createHarness(options = {}) {
     return dir;
   };
   const writeFile = (relative, content) => {
-    if (path.isAbsolute(String(relative)) || String(relative).split(/[\\/]/u).includes('..')) {
+    const raw = String(relative);
+    if (path.isAbsolute(raw) || raw.split(/[\\/]/u).includes('..')) {
       throw acceptanceError('unsafe-temp-path');
     }
-    noteRoot(String(relative).split(/[\\/]/u));
-    const file = pathOf(relative);
+    // 所有权标记是清理时的身份凭据：场景不许覆盖它。
+    if (raw.split(/[\\/]/u)[0] === TEMP_OWNER_MARKER) throw acceptanceError('unsafe-temp-path');
+    noteRoot(raw.split(/[\\/]/u));
+    const file = pathOf(raw);
     fs.mkdirSync(path.dirname(file), { recursive: true });
     fs.writeFileSync(file, String(content), 'utf8');
     return file;
@@ -428,11 +690,17 @@ export function createHarness(options = {}) {
     version: ACCEPTANCE_VERSION,
     seed,
     tempRoot: root,
+    // 本 harness 的临时区父目录（调用者给的专用父目录，或系统临时目录）。
+    // 仅用于报告/追溯：它不属于本 harness，cleanup 永远不删它。
+    tempParentRoot: tempBase,
+    tempRootSource: injectedParent === null ? 'os-tmpdir-mkdtemp' : 'caller-parent-mkdtemp',
+    // 创建时锁定的目录身份（真实路径 / dev+ino / 所有权 token），cleanup 依此拒绝"同名替换"。
+    tempRootIdentity,
     ownsTempRoot,
     injections: Object.freeze({
       now: clockSource === null ? 'virtual' : 'injected',
       seed,
-      tempDir: ownsTempRoot ? 'mkdtemp' : 'injected',
+      tempDir: injectedParent === null ? 'mkdtemp' : 'caller-parent-mkdtemp',
       brainReplies: typeof brainReplies === 'function' ? 'function' : brainReplies.length,
       sendBehavior: typeof sendBehavior === 'function' ? 'function' : sendBehavior,
       fetchImpl: injectedFetch === null ? 'deny' : 'injected',
@@ -560,6 +828,8 @@ export function createHarness(options = {}) {
       const out = [];
       const walk = (dir) => {
         for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+          // 所有权标记是框架自己的账本，不是场景证据。
+          if (dir === root && entry.name === TEMP_OWNER_MARKER) continue;
           const full = path.join(dir, entry.name);
           if (entry.isDirectory()) walk(full);
           else out.push(path.relative(root, full).split(path.sep).join('/'));
@@ -577,12 +847,18 @@ export function createHarness(options = {}) {
       return harness.tempFiles().filter((relative) => roots.has(relative.split('/')[0]));
     },
     /**
-     * 清理临时目录。幂等：第二次调用什么都不做。
-     * 只删构造时校验过的那个目录（构造期已确认在系统临时目录下、不在仓库里）。
+     * 清理本 harness 自己 mkdtemp 出来的那个目录。幂等：第二次调用什么都不做。
+     *
+     * 删之前复核身份（isSameHarnessTempRoot）：路径守卫（临时区 / 非临时根 / 非仓库 /
+     * 实路径不越界）**加上**创建时锁定的真实路径、dev+ino 与所有权标记。任何一条不符
+     * 就**一个字节都不删**并返回 false——调用者的父目录、系统临时根、仓库，以及被替换
+     * 成"同名但不是同一个"的目录，都不在删除范围内。
+     * @returns {boolean} 是否真的删除了目录
      */
     cleanup() {
       if (cleaned) return false;
       cleaned = true;
+      if (!isSameHarnessTempRoot(root, tempRootIdentity)) return false;
       fs.rmSync(root, { recursive: true, force: true });
       return true;
     },
