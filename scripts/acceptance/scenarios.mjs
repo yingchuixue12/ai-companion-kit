@@ -19,7 +19,6 @@
  */
 import fs from 'node:fs';
 import { execFile } from 'node:child_process';
-import { fileURLToPath } from 'node:url';
 import { promisify } from 'node:util';
 
 import { createPrivateTurnWindow, handleTurn, pushPrivateMessage } from '../../packages/companion/src/index.js';
@@ -2037,12 +2036,13 @@ async function runX06(harness) {
     ['onebot-reconnect-replay.test.mjs', '重连后已消费消息不复投，新消息正常投递'],
     ['onebot-closed-socket.test.mjs', '同一次断线只重连一次，忽略失效连接的事件'],
   ]) {
-    const regression = fileURLToPath(new URL('../../packages/companion/test/' + file, import.meta.url));
+    // Windows Node's test runner does not discover absolute UNC test arguments.
+    const regression = 'packages/companion/test/' + file;
     let passed = false;
     try {
       const { stdout } = await execFileAsync(process.execPath, [
         '--test', '--test-reporter=tap', '--', regression,
-      ], { env, timeout: 15_000 });
+      ], { cwd: new URL('../../', import.meta.url), env, timeout: 15_000 });
       passed = isTapAllPassed(stdout);
     } catch {
       // The report must not include child stdout or stderr.
