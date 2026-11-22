@@ -1,10 +1,8 @@
 # C-01/C-02 Web presence HTTP 离线矩阵 · 交付报告
 
 - 日期：2026-11-22
-- 基线：fork `main` `b6dece1`（#96 Web host 与 #100 web-http.js 已合入）
-- 工作树：`<worktree>`（独占；分支沿用 codex/presence-offline-acceptance 工作树）
-- 写入范围：`scripts/acceptance/**` 与本报告；未改运行产品、未改 CI、未操作远端、未写原芙兰工作树
-- 提交状态：本地提交，未推送
+- 验收基线：fork `main` `f243fc0`（已含 #96 Web host、#100 HTTP handler 和 #103 CLI 提示词预算）
+- 写入范围：`scripts/acceptance/**` 与本报告；未改运行产品、CI 配置或原芙兰工作树
 
 ## 1. 结论
 
@@ -82,7 +80,7 @@ C-01/C-02 逐项结果：
 | `node scripts/acceptance/run.mjs --offline --scenario=C-01` | 5 步全过 | 0 |
 | `node scripts/acceptance/run.mjs --offline --scenario=C-02` | 4 步全过 | 0 |
 | `node --test scripts/acceptance/acceptance.test.mjs` | 79 条测试，79 pass，0 fail | 0 |
-| `node scripts/verify.mjs` | 63 个测试文件、1026 条测试、0 fail / 0 skipped / 0 todo；结构检查 147 pass / 0 fail / 27 warnings（仓库既有告警） | 0 |
+| `node scripts/verify.mjs` | 1031 条测试、0 fail / 0 skipped / 0 todo | 0 |
 | `git diff --check` | 无空白错误 | 0 |
 
 新增/修改文件语法检查：`node --check` 通过（presence-scenarios.mjs、scenarios.mjs、run.mjs、acceptance.test.mjs）。

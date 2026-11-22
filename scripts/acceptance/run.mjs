@@ -184,7 +184,7 @@ export function buildReport({
   // 整表跑（默认）还是只跑了一个场景：决定 coverage 字段该怎么读。
   const scope = results.length === registryIds.length ? 'full-registry' : 'partial';
 
-  // C 门独立计分：C-01…C-09 全部有离线可执行证据后 offlineCGateComplete 才为 true
+  // C 门独立计分：登记的 8 项全部离线通过后 offlineCGateComplete 才为 true
   // （C-04 真实平台部分仍属 T9，不计入离线 C 门）。
   const cDenominators = cGateIds(registry);
   const passedC = executed

@@ -1066,16 +1066,23 @@ async function createWebHostFixture(harness, { root, settings, withStateFile = t
       let data = '';
       incoming.setEncoding('utf8');
       incoming.on('data', (chunk) => { data += chunk; });
-      incoming.on('end', () => resolve({
-        code: incoming.statusCode,
-        contentType: String(incoming.headers['content-type'] ?? ''),
-        cacheControl: String(incoming.headers['cache-control'] ?? ''),
-        body: data ? JSON.parse(data) : null,
-        raw: data,
-      }));
+      incoming.on('end', () => {
+        try {
+          resolve({
+            code: incoming.statusCode,
+            contentType: String(incoming.headers['content-type'] ?? ''),
+            cacheControl: String(incoming.headers['cache-control'] ?? ''),
+            body: data ? JSON.parse(data) : null,
+            raw: data,
+          });
+        } catch (error) {
+          reject(error);
+        }
+      });
       incoming.on('error', reject);
     });
     outgoing.on('error', reject);
+    outgoing.setTimeout(5_000, () => outgoing.destroy(new Error('Web presence fixture request timed out')));
     outgoing.end(body);
   });
   return {
@@ -1398,6 +1405,7 @@ async function runC02(harness) {
           sameStateFile: true,
           restoredDiagnostic: true,
           cooldownWelcome: firstWelcomeAt,
+          restoredSessionStartedAt: firstWelcomeAt,
           deliveredLedger: 0,
         },
         actual: {
@@ -1407,6 +1415,7 @@ async function runC02(harness) {
           sameStateFile: second.host.stateFile === stateFile,
           restoredDiagnostic: second.host.diagnostics.some((entry) => entry.code === 'presence-web-restored'),
           cooldownWelcome: stateAfterRestart?.cooldowns?.welcome ?? null,
+          restoredSessionStartedAt: second.host.stats.session?.sessionStartedAt ?? null,
           deliveredLedger: Array.isArray(stateAfterRestart?.deliveredIds) ? stateAfterRestart.deliveredIds.length : -1,
         },
       });
