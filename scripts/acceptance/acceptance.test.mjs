@@ -923,7 +923,7 @@ test('场景表：B 门分母是 18，未覆盖 id 与 covered id 不重叠', ()
   for (const id of missing) assert.ok(!covered.includes(id), id + ' 不该同时是 covered');
   // 增补场景只加证据，不改 B 门分母。
   for (const extra of [
-    'X-01', 'X-02', 'X-03', 'X-04', 'X-05', 'X-06',
+    'X-01', 'X-02', 'X-03', 'X-04', 'X-05', 'X-06', 'X-07',
     'D-01', 'D-02', 'D-03', 'D-04', 'E-01', 'E-02', 'E-03', 'E-04', 'E-05',
   ]) {
     assert.ok(!bGateIds().includes(extra), extra + ' 不该进 B 门分母');
@@ -938,12 +938,12 @@ test('场景表：B 门分母是 18，未覆盖 id 与 covered id 不重叠', ()
   assert.deepEqual(notCoveredCIds(), ['C-01', 'C-02']);
   assert.equal(
     listScenarios().filter((scenario) => scenario.gate === 'extra' && scenario.status === 'covered').length,
-    15,
+    16,
   );
-  // covered 总数 = 11 个 B 门 + 6 个 C 门 + 15 个增补；
+  // covered 总数 = 11 个 B 门 + 6 个 C 门 + 16 个增补（含 X-07 旁证）；
   // not-covered 是 7 个 B 门 + 2 个 C 门 + 1 个 D/E（D-05）。
-  assert.equal(covered.length, 32);
-  assert.equal(listScenarios().length, 42);
+  assert.equal(covered.length, 33);
+  assert.equal(listScenarios().length, 43);
   // 缺失的宿主 / QQ 集成路径在本 checkout 里确实不存在：用场景表登记证明，
   // 不断言任何私有目录名（公开 fork 不依赖私有宿主路径）。
   assert.equal(findScenario('B-03').status, 'not-covered');
@@ -1082,7 +1082,7 @@ test('runner：默认执行整表，退出码 0，覆盖分母与未覆盖列表
   // summary.passed 包括 C 与增补场景，B 门通过数必须单独可读。
   assert.equal(report.summary.bGatePassed, 11);
   assert.equal(report.summary.cGatePassed, 6);
-  assert.equal(report.summary.passed - report.summary.bGatePassed, 21);
+  assert.equal(report.summary.passed - report.summary.bGatePassed, 22);
   assert.equal(report.summary.coverageDenominator, 18);
   assert.equal(report.summary.cGateCoverageDenominator, 8);
   assert.equal(report.summary.completeBGate, false, 'completeBGate 必须保持 false');
@@ -1095,7 +1095,7 @@ test('runner：默认执行整表，退出码 0，覆盖分母与未覆盖列表
   // C 与增补场景按执行顺序出现在 extraExecutedIds 里，且不进入 B 门的任何列表。
   assert.deepEqual(report.coverage.extraExecutedIds, [
     'C-03', 'C-04', 'C-05', 'C-07', 'C-08', 'C-09',
-    'X-01', 'X-02', 'X-03', 'X-04', 'X-05', 'X-06',
+    'X-01', 'X-02', 'X-03', 'X-04', 'X-05', 'X-06', 'X-07',
     'D-01', 'D-02', 'D-03', 'D-04', 'E-01', 'E-02', 'E-03', 'E-04', 'E-05',
   ]);
   for (const extra of report.coverage.extraExecutedIds) {
@@ -1112,9 +1112,9 @@ test('runner：默认执行整表，退出码 0，覆盖分母与未覆盖列表
   assert.ok(report.coverage.missingBIds.includes('B-03'));
   assert.deepEqual(report.coverage.groupIds, ['C-01', 'C-02']);
   assert.equal(report.summary.notCovered, report.summary.total - report.summary.executed);
-  // 42 项 = 18 个 B 门 + 8 个 C 门 + 15 个增补 + 1 个 D/E 未覆盖（D-05）。
-  assert.equal(report.summary.total, 42);
-  assert.equal(report.summary.executed, 32);
+  // 43 项 = 18 个 B 门 + 8 个 C 门 + 16 个增补 + 1 个 D/E 未覆盖（D-05）。
+  assert.equal(report.summary.total, 43);
+  assert.equal(report.summary.executed, 33);
   assert.equal(report.summary.notCovered, 10);
   // 生成时间来自虚拟时钟：必须显式标注来源，避免被当成真实墙钟。
   assert.equal(report.generatedAtSource, 'harness-virtual-clock');
@@ -1643,7 +1643,7 @@ test('场景表：SCENARIOS 与 findScenario/coveredScenarios 口径一致', () 
 });
 
 test('场景定义：期望值是字面量，不引用产品常量（否则产品改了就恒真）', async () => {
-  const sources = ['scenarios.mjs', 'presence-scenarios.mjs']
+  const sources = ['scenarios.mjs', 'presence-scenarios.mjs', 'owner-private-scenarios.mjs']
     .map((file) => fs.readFileSync(path.join(HERE, file), 'utf8'));
   for (const constant of [
     'DEFAULT_DROP_ORDER',
@@ -1850,6 +1850,58 @@ test('增补：X-05 的离线 presence 证据——只发唯一 owner、状态�
       'x05/data/presence-qq-state.json',
       'x05/group/presence-qq-state.json',
     ]);
+  } finally {
+    capture.restore();
+    harness.cleanup();
+  }
+});
+
+/* ═══════════ 11b. X-07 owner-private 通用入口旁证 ═══════════ */
+
+test('X-07：owner-private 通用入口旁证，B-14/B-18 仍保持 not-covered', async () => {
+  const harness = createHarness();
+  const capture = captureConsole();
+  try {
+    const x07 = await runScenario('X-07', { harness });
+    assert.equal(x07.status, 'pass', JSON.stringify(x07.diagnostics));
+    assert.equal(x07.gate, 'extra');
+    assert.equal(x07.steps.length, 3);
+    assert.equal(x07.steps.reduce((sum, step) => sum + step.diff.length, 0), 0);
+
+    // ① 配置闸门先于运输/存储：没有构造 OneBot，也没有创建 data/。
+    assert.equal(x07.steps[0].actual.botConstructions, 0);
+    assert.equal(x07.steps[0].actual.dataDirsCreated, 0);
+    assert.equal(x07.steps[0].actual.fixedErrorOnly, 'true|true|true|true');
+
+    // ② 拒绝路径：群聊 / 非 owner 都没有提醒、发送、记忆。
+    assert.equal(x07.steps[1].actual.groupRejected, true);
+    assert.equal(x07.steps[1].actual.nonOwnerRejected, true);
+    assert.equal(x07.steps[1].actual.reminderRecords, 0);
+    assert.equal(x07.steps[1].actual.privateSends, 0);
+    assert.equal(x07.steps[1].actual.memoryTurns, false);
+
+    // ③ 正对照：白名单私聊真的落一条提醒并只发一条确认。
+    assert.equal(x07.steps[2].actual.reminderRecords, 1);
+    assert.equal(x07.steps[2].actual.confirmationSends, 1);
+    assert.equal(x07.steps[2].actual.confirmationUser, '10001');
+
+    // 旁证边界写死在 artifacts：不能把 X-07 读成 B-14/B-18 通过。
+    assert.equal(x07.artifacts.limitation, 'owner-private-cli-synthetic-onebot-subscenario');
+    assert.deepEqual(x07.artifacts.corroborates, ['B-14', 'B-18']);
+    assert.ok(x07.artifacts.proofRequired.length >= 3, '缺少仍需证据清单');
+    assert.deepEqual(
+      x07.artifacts.tempFiles.filter((file) => file.endsWith('reminders.json')),
+      ['x07/valid/data/reminders.json'],
+    );
+
+    for (const id of ['B-14', 'B-18']) {
+      assert.equal(findScenario(id).status, 'not-covered', id + ' 不能被 X-07 旁证改成 covered');
+      const gap = await runScenario(id, { harness });
+      assert.equal(gap.status, 'not-covered');
+      assert.deepEqual(gap.artifacts.corroboratedBy, ['X-07']);
+      assert.ok(gap.artifacts.proofRequired.length > 0, id + ' 缺少 proofRequired');
+      assert.deepEqual(gap.steps, []);
+    }
   } finally {
     capture.restore();
     harness.cleanup();
