@@ -81,18 +81,23 @@ function normalizeSendReceipt(result) {
 }
 
 export class OneBot {
+  #onStatus;
+  #attempt = 0;
+
   /**
    * @param {object} opts
    * @param {string} opts.wsUrl       例如 ws://127.0.0.1:3001
    * @param {string} [opts.httpUrl]   例如 http://127.0.0.1:3000（发消息用）
    * @param {string} [opts.accessToken]
    * @param {(msg:object)=>void} [opts.onMessage]
+   * @param {(event:object)=>void} [opts.onStatus] Receives redacted connection events in place of legacy connection logs.
    */
-  constructor({ wsUrl, httpUrl, accessToken = '', onMessage }) {
+  constructor({ wsUrl, httpUrl, accessToken = '', onMessage, onStatus }) {
     this.wsUrl = wsUrl;
     this.httpUrl = (httpUrl || '').replace(/\/+$/, '');
     this.accessToken = accessToken;
     this.onMessage = onMessage;
+    this.#onStatus = typeof onStatus === 'function' ? onStatus : null;
     this.selfId = '';
     this.ws = null;
     this.connected = false;
@@ -105,7 +110,17 @@ export class OneBot {
     return h;
   }
 
+  #connectionStatus(state, legacyLog, retryInMs = 0) {
+    if (!this.#onStatus) {
+      console.log(legacyLog());
+      return;
+    }
+    try { this.#onStatus({ state, attempt: this.#attempt, retryInMs }); }
+    catch { /* Diagnostics cannot interrupt transport. */ }
+  }
+
   async #connect() {
+    this.#attempt = Math.min(this.#attempt + 1, Number.MAX_SAFE_INTEGER);
     // 优先用 ws（可带 headers 鉴权）；本地没装或解析失败时退回全局 WebSocket。
     const { WebSocket } = await import('ws').catch(() => ({ WebSocket: globalThis.WebSocket }));
     const sock = new WebSocket(this.wsUrl, { headers: this.#headers() });
@@ -121,19 +136,19 @@ export class OneBot {
     const onOpen = () => {
       if (!current()) return;
       this.connected = true;
-      console.log('[onebot] 已连接 ' + this.wsUrl);
+      this.#connectionStatus('connected', () => '[onebot] 已连接 ' + this.wsUrl);
     };
     const onClose = () => {
       if (!current()) return;
       live = false;
       this.connected = false;
-      console.log('[onebot] 断开，5 秒后重连');
+      this.#connectionStatus('disconnected', () => '[onebot] 断开，5 秒后重连', 5000);
       // 只有「这条连接仍是当前连接」时才重连：已经换了新连接就不再补一条。
       setTimeout(() => { if (this.ws === sock) this.#connect(); }, 5000);
     };
     const onError = (e) => {
       if (!current()) return;
-      console.log('[onebot] 出错 ' + (e?.message || e?.type || e));
+      this.#connectionStatus('error', () => '[onebot] 出错 ' + (e?.message || e?.type || e));
     };
     const onFrame = (data) => {
       if (!current()) return;
