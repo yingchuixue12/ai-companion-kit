@@ -15,9 +15,9 @@
  * 合成 OneBot + 虚拟时钟；C-01/C-02 缺 Web presence 宿主路径，保持 not-covered。
  *
  * D/E 离线契约：D-01…D-04 复用 media/* 的 ASR/TTS 桩与 voice-runtime 公开入口，
- * E-01…E-05 复用 tools/registry 的 fake tool 与 host-bridge 公开入口；
- * D-05 仍显式保留为 not-covered（缺宿主附件入口）。这些是离线契约证据，
- * 不是真实语音/工具/供应商验收。
+ * D-05 复用 lib.js#createAttachmentHost 的附件元数据入口（只到 U2 前的离线契约），
+ * E-01…E-05 复用 tools/registry 的 fake tool 与 host-bridge 公开入口。
+ * 这些是离线契约证据，不是真实语音/附件理解/工具/供应商验收。
  *
  * 约定（写新场景时请守住）：
  *   1. 只填合成输入：`input.synthetic` 由框架强制为 true，写 false 会直接失败；
@@ -45,7 +45,11 @@ import { createToolRegistry } from '../../packages/companion/src/tools/registry.
 import { ingestAudio, renderVoice } from '../../packages/companion/src/media/pipeline.js';
 import { createOfflineAsrStub, createOfflineTtsStub } from '../../packages/companion/src/media/offline-stub.js';
 import { createMediaStore } from '../../packages/companion/src/media/store.js';
-import { createToolHostBridge, createVoiceRuntime } from '../../packages/companion/src/lib.js';
+import {
+  createAttachmentHost,
+  createToolHostBridge,
+  createVoiceRuntime,
+} from '../../packages/companion/src/lib.js';
 
 import { C_NOT_COVERED, C_SCENARIOS } from './presence-scenarios.mjs';
 import { OWNER_PRIVATE_SCENARIOS } from './owner-private-scenarios.mjs';
@@ -2455,6 +2459,246 @@ async function runD04(harness) {
   };
 }
 
+/* ═══════════════ D-05 图片/文件元数据（U2 前离线契约） ═══════════════ */
+
+/** 合成哨兵：只用来验证「不读、不回显」，不对应任何真实文件、路径或账号。 */
+const D05_CONTENT = 'D05-SYNTHETIC-FILE-CONTENT';
+const D05_PATH = '/home/synthetic/private/photo.png';
+const D05_URL = 'https://synthetic.invalid/private/photo.png';
+
+/**
+ * 造一个附件输入：基础字段正常，指定字段做成「一读就抛」的访问器。
+ * 不能用对象展开复制访问器——展开会立刻触发 getter，反而证明不了入口没读。
+ */
+function d05AttachmentInput(base, forbidden, reads) {
+  const input = { ...base };
+  for (const name of forbidden) {
+    Object.defineProperty(input, name, {
+      enumerable: true,
+      configurable: true,
+      get() {
+        reads.push(name);
+        throw new Error('D05 forbidden field read: ' + name);
+      },
+    });
+  }
+  return input;
+}
+
+/**
+ * D-05：公开 createAttachmentHost() 的图片/文件元数据入口。
+ *
+ * 合成测试：只喂 kind/mime/size（或 bytes 长度），ref/url/title/account/text/bytes
+ * 用「一读就抛」的访问器守住；不解析内容、不联网、不调模型、不进聊天/记忆、不落盘。
+ * 只证明 U2 之前的离线元数据契约：入口永远返回 supported:false + provider-required，
+ * 不声称能看图或读文件，也不代表真实供应商接入。
+ */
+async function runD05(harness) {
+  const host = createAttachmentHost();
+
+  /* ── ① 图片：只回元数据，路径/URL/标题/账号/正文/字节一个都不读 ── */
+  const imageReads = [];
+  const image = host.inspect(d05AttachmentInput(
+    {
+      kind: 'image',
+      // 分号参数里夹带合成路径与 URL：入口只保留 type/subtype。
+      mime: 'image/png; name=' + D05_PATH + '; url=' + D05_URL,
+      size: 12,
+    },
+    ['bytes', 'ref', 'url', 'title', 'account', 'text'],
+    imageReads,
+  ));
+  const imageEvidence = JSON.stringify(image);
+
+  harness.step({
+    title: '图片元数据：只声明 provider-required，路径/URL/标题/账号/正文/字节一个都不读',
+    input: {
+      kind: 'attachment-metadata',
+      items: [{ text: 'synthetic image/png 12 bytes', userId: 'host' }],
+      note: '合成图片元数据；mime 分号参数夹带合成路径与 URL；'
+        + 'ref/url/title/account/text/bytes 都是一读就抛的访问器',
+    },
+    delivery: { attempted: 0, sent: 0, receipts: [], texts: [], channel: 'none' },
+    expected: {
+      kind: 'image',
+      mime: 'image/png',
+      size: 12,
+      ref: null,
+      supported: false,
+      reason: 'provider-required',
+      capability: 'image-input',
+      requiresUserDecision: 'U2',
+      vision: false,
+      contentParsing: false,
+      hostEnabled: false,
+      forbiddenReads: 0,
+      leakedPath: false,
+      leakedUrl: false,
+      leakedContent: false,
+      fetchCalls: 0,
+      sends: 0,
+      events: 0,
+      tempFiles: 0,
+    },
+    actual: {
+      kind: image.kind,
+      mime: image.mime,
+      size: image.size,
+      ref: image.ref,
+      supported: image.supported === true,
+      reason: image.reason,
+      capability: image.providerRequired?.capability ?? '',
+      requiresUserDecision: image.providerRequired?.requiresUserDecision ?? '',
+      vision: image.capabilities?.vision === true,
+      contentParsing: image.capabilities?.contentParsing === true,
+      hostEnabled: host.enabled === true,
+      forbiddenReads: imageReads.length,
+      leakedPath: imageEvidence.includes(D05_PATH),
+      leakedUrl: imageEvidence.includes(D05_URL),
+      leakedContent: imageEvidence.includes(D05_CONTENT),
+      fetchCalls: harness.counters.fetchCalls,
+      sends: harness.bot.deliveries.length,
+      events: harness.events.length,
+      tempFiles: harness.scenarioTempFiles().length,
+    },
+  });
+
+  /* ── ② 文件：只按 bytes 长度算 size，不解析、不回显正文 ── */
+  const fileReads = [];
+  const file = host.readMetadata(d05AttachmentInput(
+    {
+      kind: 'file',
+      mime: 'APPLICATION/PDF',
+      bytes: Buffer.from(D05_CONTENT, 'utf8'),
+    },
+    ['ref', 'url', 'title', 'account', 'text'],
+    fileReads,
+  ));
+  const fileEvidence = JSON.stringify(file);
+
+  harness.step({
+    title: '文件元数据：只按 bytes 长度算 size，正文不解析、不回显，仍只声明 provider-required',
+    input: {
+      kind: 'attachment-metadata',
+      items: [{ text: 'synthetic application/pdf file bytes', userId: 'host' }],
+      note: '合成文件元数据；bytes 内容含哨兵串，入口只读长度；'
+        + 'ref/url/title/account/text 都是一读就抛的访问器',
+    },
+    delivery: { attempted: 0, sent: 0, receipts: [], texts: [], channel: 'none' },
+    expected: {
+      kind: 'file',
+      mime: 'application/pdf',
+      size: 26,
+      ref: null,
+      supported: false,
+      reason: 'provider-required',
+      capability: 'file-input',
+      requiresUserDecision: 'U2',
+      forbiddenReads: 0,
+      leakedPath: false,
+      leakedUrl: false,
+      leakedContent: false,
+      bytesExposed: false,
+      fetchCalls: 0,
+      sends: 0,
+      events: 0,
+      tempFiles: 0,
+    },
+    actual: {
+      kind: file.kind,
+      mime: file.mime,
+      size: file.size,
+      ref: file.ref,
+      supported: file.supported === true,
+      reason: file.reason,
+      capability: file.providerRequired?.capability ?? '',
+      requiresUserDecision: file.providerRequired?.requiresUserDecision ?? '',
+      forbiddenReads: fileReads.length,
+      leakedPath: fileEvidence.includes(D05_PATH),
+      leakedUrl: fileEvidence.includes(D05_URL),
+      leakedContent: fileEvidence.includes(D05_CONTENT),
+      bytesExposed: Object.hasOwn(file, 'bytes'),
+      fetchCalls: harness.counters.fetchCalls,
+      sends: harness.bot.deliveries.length,
+      events: harness.events.length,
+      tempFiles: harness.scenarioTempFiles().length,
+    },
+  });
+
+  /* ── ③ 默认关闭 / 显式开启：都只声明 provider-required，不变成“能看图” ── */
+  const defaultStatus = createAttachmentHost().status();
+  const enabledHost = createAttachmentHost({ enabled: true });
+  const enabledStatus = enabledHost.status();
+  const enabledImage = enabledHost.inspect({ kind: 'image', mime: 'image/png', size: 1 });
+
+  harness.step({
+    title: '默认关闭与显式开启：都只声明 provider-required，不解析内容、不读文件、不联网、不进聊天/记忆',
+    input: {
+      kind: 'attachment-host-status',
+      items: [{ text: 'attachment-host enabled=false / enabled=true', userId: 'host' }],
+      note: '两个公开入口实例 + 开启实例再识别一张合成图片；只读 status() 与元数据',
+    },
+    delivery: { attempted: 0, sent: 0, receipts: [], texts: [], channel: 'none' },
+    expected: {
+      kind: 'attachment-host',
+      version: 1,
+      defaultEnabled: false,
+      enabledEnabled: true,
+      defaultProviderRequired: true,
+      enabledProviderRequired: true,
+      parsesContent: false,
+      fetches: false,
+      readsFiles: false,
+      writesMemory: false,
+      entersChat: false,
+      enabledStillSupported: false,
+      enabledStillReason: 'provider-required',
+      enabledRef: null,
+      fetchCalls: 0,
+      sends: 0,
+      events: 0,
+      tempFiles: 0,
+    },
+    actual: {
+      kind: defaultStatus.kind,
+      version: defaultStatus.version,
+      defaultEnabled: defaultStatus.enabled === true,
+      enabledEnabled: enabledStatus.enabled === true,
+      defaultProviderRequired: defaultStatus.providerRequired === true,
+      enabledProviderRequired: enabledStatus.providerRequired === true,
+      parsesContent: defaultStatus.parsesContent === true || enabledStatus.parsesContent === true,
+      fetches: defaultStatus.fetches === true || enabledStatus.fetches === true,
+      readsFiles: defaultStatus.readsFiles === true || enabledStatus.readsFiles === true,
+      writesMemory: defaultStatus.writesMemory === true || enabledStatus.writesMemory === true,
+      entersChat: defaultStatus.entersChat === true || enabledStatus.entersChat === true,
+      enabledStillSupported: enabledImage.supported === true,
+      enabledStillReason: enabledImage.reason,
+      enabledRef: enabledImage.ref,
+      fetchCalls: harness.counters.fetchCalls,
+      sends: harness.bot.deliveries.length,
+      events: harness.events.length,
+      tempFiles: harness.scenarioTempFiles().length,
+    },
+  });
+
+  harness.assert(harness.counters.fetchCalls === 0, 'no-fetch');
+  harness.assert(harness.bot.deliveries.length === 0, 'no-chat-send');
+  harness.assert(harness.events.length === 0, 'no-model-or-memory-event');
+  harness.assert(harness.scenarioTempFiles().length === 0, 'no-file-io');
+
+  return {
+    modules: [
+      'lib.js#createAttachmentHost',
+      'media/attachment-host.js',
+      'media/pipeline.js#readAttachmentMetadata',
+    ],
+    limitation: 'attachment-metadata-offline-contract-before-U2',
+    note: '合成图片/文件元数据；只证明 U2 前的离线元数据契约（provider-required，'
+      + '不读路径/URL/标题/账号/正文/字节，不联网、不调模型、不落盘）；'
+      + '真实图片理解 / 供应商接入不在本场景内。',
+  };
+}
+
 /* ═══════════════ E-01 未知工具 ═══════════════ */
 
 /** E-01：未知工具名一律 unknown-tool，不执行、不落审计（名字不可归属）。 */
@@ -2945,19 +3189,9 @@ const NOT_COVERED = Object.freeze(Object.fromEntries([
 }])));
 
 /**
- * D/E 未覆盖项：D-05 仍显式保留为 not-covered——本 checkout 没有宿主附件入口，
- * 不用 X-03/X-04 的增补旁证冒充 D/E 验收。reason 是闭合码；requires 说明还缺什么。
+ * D/E 当前没有 not-covered 项：D-01…D-05 与 E-01…E-05 都有可执行的离线契约证据。
+ * D-05 只覆盖 U2 之前的元数据契约（provider-required），不代表真实图片理解/供应商接入。
  */
-const DE_NOT_COVERED = Object.freeze({
-  'D-05': Object.freeze({
-    id: 'D-05',
-    gate: 'extra',
-    status: 'not-covered',
-    title: '未覆盖：D-05 图片/文件元数据（缺宿主附件入口）',
-    reason: 'requires-host-attachment-path',
-    requires: '附件元数据入口（本 checkout 没有宿主附件路径）',
-  }),
-});
 
 /**
  * 场景表（显示顺序固定）。covered 的条目必须真的能跑；not-covered 只列事实。
@@ -2993,12 +3227,12 @@ export const SCENARIOS = Object.freeze([
   { id: 'X-06', aliases: ['onebot-reconnect'], gate: 'extra', status: 'covered', title: 'X-06（增补）通用 CLI 的 OneBot 重连与去重', run: runX06 },
   // X-07 只把 #95 的 --owner-private 接入通用 CLI 行为接进矩阵；B-14/B-18 仍是 not-covered。
   ...OWNER_PRIVATE_SCENARIOS,
-  // D-01…D-04 / E-01…E-05 是执行计划 §9.3 的独立验收项；与 X-01/X-03/X-04 的增补旁证区分，不复用同一 ID。
+  // D-01…D-05 / E-01…E-05 是执行计划 §9.3 的独立验收项；与 X-01/X-03/X-04 的增补旁证区分，不复用同一 ID。
   { id: 'D-01', aliases: ['asr-success'], gate: 'extra', status: 'covered', title: 'D-01 离线 ASR 成功（桩）：转写/置信度/元数据；无 memory port 不写长期记忆', run: runD01 },
   { id: 'D-02', aliases: ['asr-failure'], gate: 'extra', status: 'covered', title: 'D-02 ASR 失败（桩）：asr-failed + ask-repeat，保留元数据', run: runD02 },
   { id: 'D-03', aliases: ['tts-failure'], gate: 'extra', status: 'covered', title: 'D-03 TTS 失败（桩）：显式失败与超时都保留文字回退', run: runD03 },
   { id: 'D-04', aliases: ['voice-low-confidence-confirm'], gate: 'extra', status: 'covered', title: 'D-04 低置信度语音：确认前不进聊天/记忆，确认后只处理一次（合成 ASR + 内存记忆端口）', run: runD04 },
-  DE_NOT_COVERED['D-05'],
+  { id: 'D-05', aliases: ['attachment-metadata'], gate: 'extra', status: 'covered', title: 'D-05 图片/文件元数据：公开附件宿主只声明 provider-required，不读路径/URL/内容（U2 前离线契约）', run: runD05 },
   // E-01…E-05 按执行计划 §9.3 的语义：未知工具 / 需确认 / 超时 / 高风险 / 审计脱敏。
   { id: 'E-01', aliases: ['unknown-tool'], gate: 'extra', status: 'covered', title: 'E-01 未知工具：unknown-tool，不执行、不落审计', run: runE01 },
   { id: 'E-02', aliases: ['confirm-reject'], gate: 'extra', status: 'covered', title: 'E-02 需确认工具：拒绝后不重试，handler 不执行', run: runE02 },

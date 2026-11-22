@@ -24,9 +24,9 @@
  *      0 次生成）；同一装配用一条明确提醒作正对照（真的新建并回复任务 ID）。
  *  14. B-08 消息与到期提醒同时发生：回复在途时提醒只 claim 入队不发送；放行后
  *      回复先发、提醒后发各一次并落终态；终态再派发不重发（只证明 CLI 离线层）。
- *  15. D/E 离线契约：D-01…D-04（ASR/TTS 桩 + 语音运行入口）与
- *      E-01…E-05（fake tool + 宿主桥接）；D-05 仍显式 not-covered（缺宿主附件入口），
- *      不用增补旁证冒充 D/E 验收。
+ *  15. D/E 离线契约：D-01…D-04（ASR/TTS 桩 + 语音运行入口）、
+ *      D-05（公开附件宿主只到 U2 前的离线元数据契约）与
+ *      E-01…E-05（fake tool + 宿主桥接）；不把离线契约读成真实供应商验收。
  *
  * 全程离线：只用临时目录与内存桩，不联网、不调模型、不读写仓库 data/。
  */
@@ -924,7 +924,7 @@ test('场景表：B 门分母是 18，未覆盖 id 与 covered id 不重叠', ()
   // 增补场景只加证据，不改 B 门分母。
   for (const extra of [
     'X-01', 'X-02', 'X-03', 'X-04', 'X-05', 'X-06', 'X-07',
-    'D-01', 'D-02', 'D-03', 'D-04', 'E-01', 'E-02', 'E-03', 'E-04', 'E-05',
+    'D-01', 'D-02', 'D-03', 'D-04', 'D-05', 'E-01', 'E-02', 'E-03', 'E-04', 'E-05',
   ]) {
     assert.ok(!bGateIds().includes(extra), extra + ' 不该进 B 门分母');
     assert.ok(covered.includes(extra), extra + ' 应作为增补场景被执行');
@@ -938,25 +938,21 @@ test('场景表：B 门分母是 18，未覆盖 id 与 covered id 不重叠', ()
   assert.deepEqual(notCoveredCIds(), ['C-01', 'C-02']);
   assert.equal(
     listScenarios().filter((scenario) => scenario.gate === 'extra' && scenario.status === 'covered').length,
-    16,
+    17,
   );
-  // covered 总数 = 11 个 B 门 + 6 个 C 门 + 16 个增补（含 X-07 旁证）；
-  // not-covered 是 7 个 B 门 + 2 个 C 门 + 1 个 D/E（D-05）。
-  assert.equal(covered.length, 33);
+  // covered 总数 = 11 个 B 门 + 6 个 C 门 + 17 个增补（含 X-07 旁证与 D-05）；
+  // not-covered 只剩 7 个 B 门 + 2 个 C 门。
+  assert.equal(covered.length, 34);
   assert.equal(listScenarios().length, 43);
   // 缺失的宿主 / QQ 集成路径在本 checkout 里确实不存在：用场景表登记证明，
   // 不断言任何私有目录名（公开 fork 不依赖私有宿主路径）。
   assert.equal(findScenario('B-03').status, 'not-covered');
-  // D-04/E-05 已有独立可执行证据；D-05 仍缺宿主附件入口，不能用桩冒充。
-  for (const id of ['D-04', 'E-05']) {
+  // D-04/D-05/E-05 都有独立可执行证据；D-05 只到 U2 前的离线元数据契约。
+  for (const id of ['D-04', 'D-05', 'E-05']) {
     const scenario = findScenario(id);
     assert.equal(scenario.status, 'covered', id + ' 应有独立可执行证据');
     assert.equal(typeof scenario.run, 'function', id + ' 缺少 run');
   }
-  const d05 = findScenario('D-05');
-  assert.equal(d05.status, 'not-covered', 'D-05 应保留为未覆盖');
-  assert.equal(d05.run, undefined, 'D-05 不能用桩冒充验收');
-  assert.ok(d05.reason.length > 0);
 });
 
 test('场景表：每个 covered 场景都有可执行的 run，not-covered 只有说明', () => {
@@ -1082,7 +1078,7 @@ test('runner：默认执行整表，退出码 0，覆盖分母与未覆盖列表
   // summary.passed 包括 C 与增补场景，B 门通过数必须单独可读。
   assert.equal(report.summary.bGatePassed, 11);
   assert.equal(report.summary.cGatePassed, 6);
-  assert.equal(report.summary.passed - report.summary.bGatePassed, 22);
+  assert.equal(report.summary.passed - report.summary.bGatePassed, 23);
   assert.equal(report.summary.coverageDenominator, 18);
   assert.equal(report.summary.cGateCoverageDenominator, 8);
   assert.equal(report.summary.completeBGate, false, 'completeBGate 必须保持 false');
@@ -1096,7 +1092,7 @@ test('runner：默认执行整表，退出码 0，覆盖分母与未覆盖列表
   assert.deepEqual(report.coverage.extraExecutedIds, [
     'C-03', 'C-04', 'C-05', 'C-07', 'C-08', 'C-09',
     'X-01', 'X-02', 'X-03', 'X-04', 'X-05', 'X-06', 'X-07',
-    'D-01', 'D-02', 'D-03', 'D-04', 'E-01', 'E-02', 'E-03', 'E-04', 'E-05',
+    'D-01', 'D-02', 'D-03', 'D-04', 'D-05', 'E-01', 'E-02', 'E-03', 'E-04', 'E-05',
   ]);
   for (const extra of report.coverage.extraExecutedIds) {
     assert.ok(!report.coverage.missingBIds.includes(extra), extra + ' 混进了 missingBIds');
@@ -1112,10 +1108,10 @@ test('runner：默认执行整表，退出码 0，覆盖分母与未覆盖列表
   assert.ok(report.coverage.missingBIds.includes('B-03'));
   assert.deepEqual(report.coverage.groupIds, ['C-01', 'C-02']);
   assert.equal(report.summary.notCovered, report.summary.total - report.summary.executed);
-  // 43 项 = 18 个 B 门 + 8 个 C 门 + 16 个增补 + 1 个 D/E 未覆盖（D-05）。
+  // 43 项 = 18 个 B 门 + 8 个 C 门 + 17 个增补；not-covered 只剩 9 个 B/C 缺口。
   assert.equal(report.summary.total, 43);
-  assert.equal(report.summary.executed, 33);
-  assert.equal(report.summary.notCovered, 10);
+  assert.equal(report.summary.executed, 34);
+  assert.equal(report.summary.notCovered, 9);
   // 生成时间来自虚拟时钟：必须显式标注来源，避免被当成真实墙钟。
   assert.equal(report.generatedAtSource, 'harness-virtual-clock');
   assert.equal(report.generatedAt, '2026-01-01T00:00:00.000Z');
@@ -2289,15 +2285,101 @@ test('E-05：宿主桥接审计不含参数正文、异常原文或确认凭据'
   }
 });
 
-test('D-05 仍明确保留为未覆盖；D-04/E-05 已有独立 run', () => {
-  const d05 = findScenario('D-05');
-  assert.equal(d05.status, 'not-covered', 'D-05 应保留为未覆盖');
-  assert.equal(d05.run, undefined, 'D-05 不能用桩冒充验收');
-  assert.ok(d05.reason.length > 0);
-  for (const id of ['D-04', 'E-05']) {
-    const scenario = findScenario(id);
-    assert.equal(scenario.status, 'covered', id + ' 应有独立可执行证据');
-    assert.equal(typeof scenario.run, 'function', id + ' 缺少 run');
+test('D-05：附件元数据只到 U2 前的离线契约——provider-required，不读路径/URL/内容', async () => {
+  const harness = createHarness();
+  const capture = captureConsole();
+  try {
+    const result = await runScenario('D-05', { harness });
+    assert.equal(result.status, 'pass', JSON.stringify(result.diagnostics));
+    assert.equal(result.gate, 'extra');
+    assert.equal(result.steps.length, 3);
+    assert.equal(result.steps.reduce((sum, step) => sum + step.diff.length, 0), 0);
+
+    const [image, file, host] = result.steps;
+
+    // ① 图片：只回元数据 + provider-required；路径/URL/正文都不在结果里。
+    assert.equal(image.actual.kind, 'image');
+    assert.equal(image.actual.mime, 'image/png');
+    assert.equal(image.actual.size, 12);
+    assert.equal(image.actual.ref, null);
+    assert.equal(image.actual.supported, false);
+    assert.equal(image.actual.reason, 'provider-required');
+    assert.equal(image.actual.capability, 'image-input');
+    assert.equal(image.actual.requiresUserDecision, 'U2');
+    assert.equal(image.actual.vision, false);
+    assert.equal(image.actual.contentParsing, false);
+    assert.equal(image.actual.hostEnabled, false);
+    assert.equal(image.actual.forbiddenReads, 0, '入口读取了路径/URL/标题/账号/正文/字节字段');
+    assert.equal(image.actual.leakedPath, false);
+    assert.equal(image.actual.leakedUrl, false);
+    assert.equal(image.actual.leakedContent, false);
+    assert.equal(image.actual.fetchCalls, 0);
+    assert.equal(image.actual.sends, 0);
+    assert.equal(image.actual.events, 0);
+    assert.equal(image.actual.tempFiles, 0);
+
+    // ② 文件：size 只按 bytes 长度算，正文不解析、不回显。
+    assert.equal(file.actual.kind, 'file');
+    assert.equal(file.actual.mime, 'application/pdf');
+    assert.equal(file.actual.size, 26);
+    assert.equal(file.actual.ref, null);
+    assert.equal(file.actual.supported, false);
+    assert.equal(file.actual.reason, 'provider-required');
+    assert.equal(file.actual.capability, 'file-input');
+    assert.equal(file.actual.requiresUserDecision, 'U2');
+    assert.equal(file.actual.forbiddenReads, 0);
+    assert.equal(file.actual.leakedPath, false);
+    assert.equal(file.actual.leakedUrl, false);
+    assert.equal(file.actual.leakedContent, false);
+    assert.equal(file.actual.bytesExposed, false);
+    assert.equal(file.actual.fetchCalls, 0);
+    assert.equal(file.actual.sends, 0);
+    assert.equal(file.actual.events, 0);
+    assert.equal(file.actual.tempFiles, 0);
+
+    // ③ 默认关闭 / 显式开启：都只声明 provider-required，不变成“能看图”。
+    assert.equal(host.actual.kind, 'attachment-host');
+    assert.equal(host.actual.version, 1);
+    assert.equal(host.actual.defaultEnabled, false);
+    assert.equal(host.actual.enabledEnabled, true);
+    assert.equal(host.actual.defaultProviderRequired, true);
+    assert.equal(host.actual.enabledProviderRequired, true);
+    assert.equal(host.actual.parsesContent, false);
+    assert.equal(host.actual.fetches, false);
+    assert.equal(host.actual.readsFiles, false);
+    assert.equal(host.actual.writesMemory, false);
+    assert.equal(host.actual.entersChat, false);
+    assert.equal(host.actual.enabledStillSupported, false);
+    assert.equal(host.actual.enabledStillReason, 'provider-required');
+    assert.equal(host.actual.enabledRef, null);
+    assert.equal(host.actual.fetchCalls, 0);
+    assert.equal(host.actual.sends, 0);
+    assert.equal(host.actual.events, 0);
+    assert.equal(host.actual.tempFiles, 0);
+
+    // 证据里不能出现合成路径 / URL / 正文（否则报告不再能证明“不回显”）。
+    const evidence = JSON.stringify(result.steps);
+    assert.equal(evidence.includes('/home/synthetic/private/photo.png'), false, '路径进了证据');
+    assert.equal(evidence.includes('https://synthetic.invalid/private/photo.png'), false, 'URL 进了证据');
+    assert.equal(evidence.includes('D05-SYNTHETIC-FILE-CONTENT'), false, '文件正文进了证据');
+
+    assert.deepEqual(result.artifacts.tempFiles, []);
+    assert.equal(result.artifacts.limitation, 'attachment-metadata-offline-contract-before-U2');
+    assert.match(result.artifacts.note, /U2 前/u);
+    assert.match(result.artifacts.note, /真实图片理解/u);
+    assert.deepEqual(result.artifacts.modules, [
+      'lib.js#createAttachmentHost',
+      'media/attachment-host.js',
+      'media/pipeline.js#readAttachmentMetadata',
+    ]);
+
+    // D-05 现在是 covered（只指 U2 前的离线元数据契约），不是真实供应商验收。
+    const d05 = findScenario('D-05');
+    assert.equal(d05.status, 'covered');
+    assert.equal(typeof d05.run, 'function');
+  } finally {
+    capture.restore();
+    harness.cleanup();
   }
 });
 
