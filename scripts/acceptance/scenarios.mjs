@@ -10,6 +10,10 @@
  *   not-covered  —— 依赖本 checkout 里**不存在**的东西（宿主集成、QQ/OneBot 集成、
  *                   计划文档里的语义），因此**没有**执行证据；不用纯桩断言冒充验收。
  *
+ * D/E 离线契约：D-01…D-03 复用 media/* 的 ASR/TTS 桩，E-01…E-04 复用
+ * tools/registry 的 fake tool；D-04/D-05/E-05 仍显式保留为 not-covered。
+ * 这些是离线契约证据，不是真实语音/工具/供应商验收。
+ *
  * 约定（写新场景时请守住）：
  *   1. 只填合成输入：`input.synthetic` 由框架强制为 true，写 false 会直接失败；
  *   2. 每一步都用 harness.step 记齐 8 个事实槽位，期望与实际分开写，差异由框架算；
@@ -2057,6 +2061,450 @@ async function runX06(harness) {
   return { limitation: 'synthetic-cli-reconnect-no-host-journal' };
 }
 
+/* ═══════════════ D-01 离线 ASR 成功（桩） ═══════════════ */
+
+/**
+ * D-01：离线 ASR 桩返回转写、置信度与元数据；没有注入 memory port 时不写长期记忆。
+ * 只证明离线桩契约，不是真实 ASR 供应商验收。
+ */
+async function runD01(harness) {
+  const input = {
+    kind: 'audio',
+    mime: 'audio/ogg',
+    size: 5,
+    durationMs: 1200,
+    ref: 'synthetic://d01/voice-1',
+  };
+  const result = await ingestAudio({
+    asr: createOfflineAsrStub({
+      transcripts: [{ text: '今天有点累', confidence: 0.92, language: 'zh' }],
+    }),
+    input,
+  });
+  harness.assert(harness.counters.fetchCalls === 0, 'no-fetch');
+
+  harness.step({
+    title: '离线 ASR 成功（桩）：转写 + 置信度 + 元数据；没有 memory port 时不写长期记忆',
+    input: {
+      kind: 'audio-message',
+      items: [{ text: 'synthetic audio d01', userId: VISITOR }],
+      note: 'ASR 是 offline-asr-stub；没有注入 memory port',
+    },
+    expected: {
+      ok: true,
+      text: '今天有点累',
+      confidence: 0.92,
+      language: 'zh',
+      provider: 'offline-asr-stub',
+      mime: 'audio/ogg',
+      size: 5,
+      durationMs: 1200,
+      ref: 'synthetic://d01/voice-1',
+      eligible: true,
+      written: false,
+      reason: 'memory-port-missing',
+      hasError: false,
+    },
+    actual: {
+      ok: result.ok === true,
+      text: result.transcript?.text ?? '',
+      confidence: result.transcript?.confidence ?? null,
+      language: result.transcript?.language ?? '',
+      provider: result.transcript?.provider ?? '',
+      mime: result.metadata?.mime ?? '',
+      size: result.metadata?.size ?? null,
+      durationMs: result.metadata?.durationMs ?? null,
+      ref: result.metadata?.ref ?? '',
+      eligible: result.memory?.eligible === true,
+      written: result.memory?.written === true,
+      reason: result.memory?.reason ?? '',
+      hasError: Object.hasOwn(result, 'error'),
+    },
+  });
+
+  return {
+    modules: ['media/pipeline.js', 'media/offline-stub.js'],
+    limitation: 'offline-asr-stub-no-real-provider',
+  };
+}
+
+/* ═══════════════ D-02 ASR 失败（桩） ═══════════════ */
+
+/**
+ * D-02：ASR 失败返回结构化 asr-failed，并给出请求重说（ask-repeat）；
+ * 元数据保留，调用方可以据此让用户重说或走文字回退。
+ */
+async function runD02(harness) {
+  const input = {
+    kind: 'audio',
+    mime: 'audio/ogg',
+    size: 5,
+    durationMs: 1200,
+    ref: 'synthetic://d02/voice-1',
+  };
+  const result = await ingestAudio({
+    asr: createOfflineAsrStub({ transcripts: [], failWith: { code: 'asr-failed' } }),
+    input,
+  });
+  harness.assert(harness.counters.fetchCalls === 0, 'no-fetch');
+
+  harness.step({
+    title: 'ASR 失败（桩）：结构化 asr-failed + 请求重说（ask-repeat），保留元数据',
+    input: {
+      kind: 'audio-message',
+      items: [{ text: 'synthetic audio d02', userId: VISITOR }],
+      note: 'offline-asr-stub 被要求失败；不产生真实转写',
+    },
+    expected: {
+      ok: false,
+      code: 'asr-failed',
+      action: 'ask-repeat',
+      retryable: true,
+      ref: 'synthetic://d02/voice-1',
+      transcript: null,
+    },
+    actual: {
+      ok: result.ok === true,
+      code: result.error?.code ?? '',
+      action: result.recovery?.action ?? '',
+      retryable: result.recovery?.retryable === true,
+      ref: result.metadata?.ref ?? '',
+      transcript: result.transcript ?? null,
+    },
+  });
+
+  return {
+    modules: ['media/pipeline.js', 'media/offline-stub.js'],
+    limitation: 'offline-asr-stub-no-real-provider',
+  };
+}
+
+/* ═══════════════ D-03 TTS 失败（桩） ═══════════════ */
+
+/**
+ * D-03：TTS 显式失败与超时都保留 fallbackText，不产生音频、不落媒体存储。
+ * 只证明离线 TTS 桩的失败回退契约，不是真实 TTS 供应商验收。
+ */
+async function runD03(harness) {
+  const store = createMediaStore({
+    root: harness.dirOf('d03'),
+    now: () => harness.now(),
+    retentionMs: 60 * 60 * 1000,
+  });
+  const text = '保留这句文字';
+
+  const failed = await renderVoice({
+    tts: createOfflineTtsStub({ failWith: true }),
+    text,
+    store,
+    format: 'ogg',
+  });
+  harness.assert(harness.counters.fetchCalls === 0, 'no-fetch');
+
+  harness.step({
+    title: 'TTS 失败（桩）：显式 tts-failed，文字回退原样保留，不落音频',
+    input: {
+      kind: 'voice-render',
+      items: [{ text, userId: VISITOR }],
+      note: 'offline-tts-stub 被要求失败；不产生真实语音',
+    },
+    expected: {
+      ok: false,
+      code: 'tts-failed',
+      fallbackKept: true,
+      fallbackChars: 6,
+      audioRef: null,
+      stored: 0,
+    },
+    actual: {
+      ok: failed.ok === true,
+      code: failed.error?.code ?? '',
+      fallbackKept: failed.fallbackText === text,
+      fallbackChars: [...String(failed.fallbackText ?? '')].length,
+      audioRef: failed.audioRef ?? null,
+      stored: store.list().length,
+    },
+  });
+
+  const timedOut = await renderVoice({
+    tts: createOfflineTtsStub({ delayMs: 50 }),
+    text,
+    store,
+    format: 'ogg',
+    timeoutMs: 5,
+  });
+
+  harness.step({
+    title: 'TTS 超时（桩）：timeout 同样保留文字回退，不落音频',
+    input: {
+      kind: 'voice-render',
+      items: [{ text, userId: VISITOR }],
+      note: 'offline-tts-stub 延迟 50ms，管线 5ms 超时',
+    },
+    expected: {
+      ok: false,
+      code: 'timeout',
+      fallbackKept: true,
+      fallbackChars: 6,
+      audioRef: null,
+      stored: 0,
+    },
+    actual: {
+      ok: timedOut.ok === true,
+      code: timedOut.error?.code ?? '',
+      fallbackKept: timedOut.fallbackText === text,
+      fallbackChars: [...String(timedOut.fallbackText ?? '')].length,
+      audioRef: timedOut.audioRef ?? null,
+      stored: store.list().length,
+    },
+  });
+
+  return {
+    modules: ['media/pipeline.js', 'media/offline-stub.js', 'media/store.js'],
+    limitation: 'offline-tts-stub-no-real-provider',
+  };
+}
+
+/* ═══════════════ E-01 未知工具 ═══════════════ */
+
+/** E-01：未知工具名一律 unknown-tool，不执行、不落审计（名字不可归属）。 */
+async function runE01(harness) {
+  const registry = createToolRegistry({ now: () => harness.now() });
+  const result = await registry.execute('no_such_tool', {});
+  harness.assert(harness.counters.fetchCalls === 0, 'no-fetch');
+
+  harness.step({
+    title: '未知工具：unknown-tool，不执行、不落审计（名字不可归属）',
+    input: { kind: 'tool-call', items: [{ text: 'no_such_tool', userId: 'system' }] },
+    tools: [{ name: 'no_such_tool', ok: false, code: result.code, policy: 'unknown' }],
+    expected: { ok: false, code: 'unknown-tool', auditEntries: 0 },
+    actual: {
+      ok: result.ok === true,
+      code: result.code ?? '',
+      auditEntries: registry.audit().length,
+    },
+  });
+
+  return { modules: ['tools/registry.js'], limitation: 'fake-tool-registry-offline' };
+}
+
+/* ═══════════════ E-02 需确认工具（拒绝路径） ═══════════════ */
+
+/**
+ * E-02：confirm 级工具必须请求确认；拒绝后同一 actionId 不能重试、不能翻案，
+ * handler 一次都不执行。批准路径由 X-01 覆盖，这里只证明拒绝路径。
+ */
+async function runE02(harness) {
+  let runs = 0;
+  const registry = createToolRegistry({
+    now: () => harness.now(),
+    createActionId: () => 'action-e02',
+  });
+  const schema = {
+    type: 'object',
+    additionalProperties: false,
+    properties: { text: { type: 'string', description: '演示正文' } },
+  };
+  registry.register({
+    name: 'demo_confirm',
+    description: '演示：需要确认的工具（纯内存）',
+    parameters: schema,
+    risk: 'confirm',
+    permissions: ['note:write'],
+    timeoutMs: 1000,
+    failurePolicy: 'stop',
+    compensate: null,
+    schedulable: false,
+    auditFields: ['trigger'],
+    handler() {
+      runs += 1;
+      return { done: true };
+    },
+  });
+
+  const withoutId = await registry.execute('demo_confirm', { text: 'ok' }, { permissions: ['note:write'] });
+  const request = registry.requestConfirmation('demo_confirm', { text: 'ok' });
+  const pending = await registry.execute(
+    'demo_confirm',
+    { text: 'ok' },
+    { permissions: ['note:write'], actionId: request.actionId },
+  );
+  const deny = registry.decideConfirmation(request.actionId, 'deny');
+  const denied = await registry.execute(
+    'demo_confirm',
+    { text: 'ok' },
+    { permissions: ['note:write'], actionId: request.actionId },
+  );
+  const retry = await registry.execute(
+    'demo_confirm',
+    { text: 'ok' },
+    { permissions: ['note:write'], actionId: request.actionId },
+  );
+  const audit = registry.audit();
+  const count = (event, code) => audit.filter(
+    (entry) => entry.event === event && (code === undefined || entry.code === code),
+  ).length;
+  harness.assert(harness.counters.fetchCalls === 0, 'no-fetch');
+
+  harness.step({
+    title: '需确认工具：未批准不执行、拒绝后同一 actionId 不能重试',
+    input: {
+      kind: 'tool-call',
+      items: [{ text: 'demo_confirm', userId: 'system' }],
+      note: '请求 → 待批 → 拒绝 → 重试',
+    },
+    tools: [{ name: 'demo_confirm', ok: false, code: denied.code, policy: 'confirm' }],
+    expected: {
+      withoutId: 'confirmation-required',
+      pending: 'confirmation-pending',
+      requestOk: true,
+      denyOk: true,
+      denyStatus: 'denied',
+      denied: 'confirmation-denied',
+      retry: 'confirmation-denied',
+      handlerRuns: 0,
+      requestAudit: 1,
+      decisionAudit: 1,
+      deniedAudit: 2,
+    },
+    actual: {
+      withoutId: withoutId.code ?? '',
+      pending: pending.code ?? '',
+      requestOk: request.ok === true,
+      denyOk: deny.ok === true,
+      denyStatus: deny.status ?? '',
+      denied: denied.code ?? '',
+      retry: retry.code ?? '',
+      handlerRuns: runs,
+      requestAudit: count('confirmation-request'),
+      decisionAudit: count('confirmation-decision'),
+      deniedAudit: count('execute', 'confirmation-denied'),
+    },
+  });
+
+  return { modules: ['tools/registry.js'], limitation: 'fake-tool-registry-offline' };
+}
+
+/* ═══════════════ E-03 工具超时 ═══════════════ */
+
+/**
+ * E-03：handler 超过 timeoutMs 时只回结构化 timeout，不伪成功；
+ * 审计留下 timeout 执行记录，迟到结果不再改写。
+ */
+async function runE03(harness) {
+  const registry = createToolRegistry({ now: () => harness.now() });
+  const schema = {
+    type: 'object',
+    additionalProperties: false,
+    properties: { text: { type: 'string', description: '演示正文' } },
+  };
+  registry.register({
+    name: 'demo_slow',
+    description: '演示：永不返回的工具（纯内存）',
+    parameters: schema,
+    risk: 'read-only',
+    permissions: ['note:write'],
+    timeoutMs: 20,
+    failurePolicy: 'stop',
+    compensate: null,
+    schedulable: false,
+    auditFields: ['trigger'],
+    handler() {
+      return new Promise(() => {});
+    },
+  });
+
+  const started = Date.now();
+  const result = await registry.execute('demo_slow', { text: 'ok' }, { permissions: ['note:write'] });
+  const elapsed = Date.now() - started;
+  const audit = registry.audit();
+  harness.assert(harness.counters.fetchCalls === 0, 'no-fetch');
+
+  harness.step({
+    title: '工具超时：结构化 timeout，审计记 timeout，不伪成功',
+    input: {
+      kind: 'tool-call',
+      items: [{ text: 'demo_slow', userId: 'system' }],
+      note: 'handler 永不 resolve；timeoutMs=20',
+    },
+    tools: [{ name: 'demo_slow', ok: false, code: result.code, policy: 'read-only' }],
+    expected: {
+      ok: false,
+      code: 'timeout',
+      auditLastCode: 'timeout',
+      auditLastEvent: 'execute',
+      elapsedAtLeast15: true,
+    },
+    actual: {
+      ok: result.ok === true,
+      code: result.code ?? '',
+      auditLastCode: audit.at(-1)?.code ?? '',
+      auditLastEvent: audit.at(-1)?.event ?? '',
+      elapsedAtLeast15: elapsed >= 15,
+    },
+  });
+
+  return { modules: ['tools/registry.js'], limitation: 'fake-tool-registry-offline' };
+}
+
+/* ═══════════════ E-04 高风险工具 ═══════════════ */
+
+/**
+ * E-04：high-risk 工具只允许登记，执行默认 risk-not-allowed；handler 永不执行。
+ * 真实高风险工具授权仍属 U3，不在离线场景内。
+ */
+async function runE04(harness) {
+  let runs = 0;
+  const registry = createToolRegistry({ now: () => harness.now() });
+  const schema = {
+    type: 'object',
+    additionalProperties: false,
+    properties: { text: { type: 'string', description: '演示正文' } },
+  };
+  registry.register({
+    name: 'demo_high_risk',
+    description: '演示：高风险工具只登记（纯内存）',
+    parameters: schema,
+    risk: 'high-risk',
+    permissions: ['note:write'],
+    timeoutMs: 1000,
+    failurePolicy: 'stop',
+    compensate: null,
+    schedulable: false,
+    auditFields: ['trigger'],
+    handler() {
+      runs += 1;
+      return { done: true };
+    },
+  });
+
+  const result = await registry.execute('demo_high_risk', { text: 'ok' }, { permissions: ['note:write'] });
+  const audit = registry.audit();
+  harness.assert(harness.counters.fetchCalls === 0, 'no-fetch');
+
+  harness.step({
+    title: '高风险工具：默认 risk-not-allowed，永不执行，审计留拒绝码',
+    input: { kind: 'tool-call', items: [{ text: 'demo_high_risk', userId: 'system' }] },
+    tools: [{ name: 'demo_high_risk', ok: false, code: result.code, policy: 'high-risk' }],
+    expected: {
+      ok: false,
+      code: 'risk-not-allowed',
+      handlerRuns: 0,
+      auditLastCode: 'risk-not-allowed',
+      auditConfirmation: 'not-required',
+    },
+    actual: {
+      ok: result.ok === true,
+      code: result.code ?? '',
+      handlerRuns: runs,
+      auditLastCode: audit.at(-1)?.code ?? '',
+      auditConfirmation: audit.at(-1)?.confirmation ?? '',
+    },
+  });
+
+  return { modules: ['tools/registry.js'], limitation: 'high-risk-stub-requires-U3-to-enable' };
+}
+
 /* ══════════════════════ 场景表 ══════════════════════ */
 
 /**
@@ -2080,11 +2528,9 @@ const NOT_COVERED = Object.freeze(Object.fromEntries([
   requires: '宿主集成路径或 QQ/OneBot 集成路径（本 checkout 不存在）',
 }])));
 
-/** C / D / E 组：计划文档不在本 checkout，无法枚举子场景 id，只能按组标未覆盖。 */
+/** C 组：计划文档不在本 checkout，无法枚举子场景 id，只能按组标未覆盖。 */
 const GROUP_NOT_COVERED = [
   ['C-*', 'C 组（计划文档未随本 checkout 提供，无法枚举子场景）'],
-  ['D-*', 'D 组（同上）'],
-  ['E-*', 'E 组（同上）'],
 ].map(([id, title]) => ({
   id,
   gate: 'group',
@@ -2093,6 +2539,37 @@ const GROUP_NOT_COVERED = [
   reason: 'plan-document-absent',
   requires: '宿主集成计划文档（本 checkout 不存在）',
 }));
+
+/**
+ * D/E 未覆盖项：仍显式保留为 not-covered，不用 X-03/X-04 的增补旁证冒充 D/E 验收。
+ * reason 是闭合码；requires 说明还缺什么。
+ */
+const DE_NOT_COVERED = Object.freeze({
+  'D-04': Object.freeze({
+    id: 'D-04',
+    gate: 'extra',
+    status: 'not-covered',
+    title: '未覆盖：D-04 低置信度（当前只有 X-04 增补旁证）',
+    reason: 'extra-only-in-X-04',
+    requires: '独立的 D-04 低置信度验收；X-04 只是增补旁证，未提升为 D-04',
+  }),
+  'D-05': Object.freeze({
+    id: 'D-05',
+    gate: 'extra',
+    status: 'not-covered',
+    title: '未覆盖：D-05 图片/文件元数据（缺宿主附件入口）',
+    reason: 'requires-host-attachment-path',
+    requires: '附件元数据入口（本 checkout 没有宿主附件路径）',
+  }),
+  'E-05': Object.freeze({
+    id: 'E-05',
+    gate: 'extra',
+    status: 'not-covered',
+    title: '未覆盖：E-05 审计脱敏（当前只有 X-03 增补旁证）',
+    reason: 'extra-only-in-X-03',
+    requires: '独立的 E-05 审计脱敏验收；X-03 只是增补旁证，未提升为 E-05',
+  }),
+});
 
 /**
  * 场景表（显示顺序固定）。covered 的条目必须真的能跑；not-covered 只列事实。
@@ -2124,6 +2601,18 @@ export const SCENARIOS = Object.freeze([
   { id: 'X-04', aliases: ['media-pipeline-offline'], gate: 'extra', status: 'covered', title: 'X-04（增补）离线媒体：低置信度不写记忆、临时音频删除审计、TTS 失败保留文字', run: runX04 },
   { id: 'X-05', aliases: ['presence-qq-runtime'], gate: 'extra', status: 'covered', title: 'X-05（增补）离线 QQ presence runtime：白名单闸门、唯一 owner 欢迎、状态文件白名单、重启冷却/台账、私聊不自指、群聊不触发', run: runX05 },
   { id: 'X-06', aliases: ['onebot-reconnect'], gate: 'extra', status: 'covered', title: 'X-06（增补）通用 CLI 的 OneBot 重连与去重', run: runX06 },
+  // D-01…D-03 / E-01…E-04 是执行计划 §9.3 的独立验收项；与 X-01/X-04 的增补旁证区分，不复用同一 ID。
+  { id: 'D-01', aliases: ['asr-success'], gate: 'extra', status: 'covered', title: 'D-01 离线 ASR 成功（桩）：转写/置信度/元数据；无 memory port 不写长期记忆', run: runD01 },
+  { id: 'D-02', aliases: ['asr-failure'], gate: 'extra', status: 'covered', title: 'D-02 ASR 失败（桩）：asr-failed + ask-repeat，保留元数据', run: runD02 },
+  { id: 'D-03', aliases: ['tts-failure'], gate: 'extra', status: 'covered', title: 'D-03 TTS 失败（桩）：显式失败与超时都保留文字回退', run: runD03 },
+  DE_NOT_COVERED['D-04'],
+  DE_NOT_COVERED['D-05'],
+  // E-01…E-04 按执行计划 §9.3 的语义：未知工具 / 需确认 / 超时 / 高风险。
+  { id: 'E-01', aliases: ['unknown-tool'], gate: 'extra', status: 'covered', title: 'E-01 未知工具：unknown-tool，不执行、不落审计', run: runE01 },
+  { id: 'E-02', aliases: ['confirm-reject'], gate: 'extra', status: 'covered', title: 'E-02 需确认工具：拒绝后不重试，handler 不执行', run: runE02 },
+  { id: 'E-03', aliases: ['tool-timeout'], gate: 'extra', status: 'covered', title: 'E-03 工具超时：结构化 timeout + 审计，不伪成功', run: runE03 },
+  { id: 'E-04', aliases: ['high-risk-tool'], gate: 'extra', status: 'covered', title: 'E-04 高风险工具：默认 risk-not-allowed，永不执行', run: runE04 },
+  DE_NOT_COVERED['E-05'],
   ...GROUP_NOT_COVERED,
 ].map((scenario) => Object.freeze(scenario)));
 
